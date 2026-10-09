@@ -1,0 +1,14 @@
+# 运行时依赖（与 pyproject.toml 的 [project.dependencies] 对齐）
+# 安装：pip install -r requirements.txt
+# 开发依赖（pytest/httpx/ruff）：pip install -e ".[dev]"
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+pydantic-settings>=2.1
+openai>=1.0
+numpy
+requests
+torch
+transformers
+peft
+sentence-transformers

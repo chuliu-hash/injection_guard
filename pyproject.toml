@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "injection-guard"
+version = "0.1.0"
+description = "AI 安全防御系统：提示注入 / 越狱检测 + OpenAI 兼容推理服务"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "injection_guard" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "openai>=1.0",
+    "numpy",
+    "requests",
+    # 模型推理相关（版本由部署环境决定，故不锁版本）
+    "torch",
+    "transformers",
+    "peft",
+    "sentence-transformers",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.4"]
+
+[project.scripts]
+injection-guard-defense = "injection_guard.cli.serve_defense:main"
+injection-guard-llm = "injection_guard.cli.serve_llm:main"
+injection-guard-embed = "injection_guard.cli.serve_embed:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+injection_guard = ["resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B"]
+# E501：交由格式化处理（含较长的 prompt 模板与日志行）
+# B008：FastAPI 的 `Depends(...)` 默认参数惯用法，非缺陷
+ignore = ["E501", "B008"]

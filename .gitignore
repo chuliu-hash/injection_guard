@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境配置（含密钥，勿入库）
+.env
+
+# 模型权重与运行时产物
+models/
+*.pt
+*.bin
+*.safetensors
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 前端（Node）
+node_modules/
+frontend/dist/
+frontend/.vite/
+coverage/
+*.local
