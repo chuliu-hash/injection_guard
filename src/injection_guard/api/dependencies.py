@@ -515,7 +515,12 @@ class DefenseService:
 
         - 输入不安全：``stopped_at="input_detection"``；
         - 输入安全且高置信：``stopped_at="output_skipped"``，跳过输出检测（仍返回 model_response）；
-        - 否则走完输出检测：``stopped_at=None``。
+        - 走完输出检测且判定不安全：``stopped_at="output_detection"``；
+        - 走完输出检测且判定安全：``stopped_at=None``。
+
+        ``model_response`` 一律**原样返回**（不替换成拦截文案）：调用方传了
+        ``model_response`` 时那是"待检测的文本"，替换会破坏纯检测用法；流式路径下
+        文本也已发出、无从撤回。是否拦截展示由前端按 ``stopped_at`` 决定。
         """
         # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
         try:
@@ -603,8 +608,23 @@ class DefenseService:
             "failed_rules": output_result.failed_rules,
             "total_rules": output_result.total_rules,
         }
+        # 输出不安全 -> stopped_at="output_detection"（前端据此替换回复）
+        if not output_result.is_safe:
+            logger.warning(
+                "[输出拦截] stopped_at=output_detection（命中类别: %s / 共 %s 条规则）",
+                ", ".join(output_result.failed_rules) or "未给出",
+                output_result.total_rules,
+            )
+            return DefendOutcome(
+                False,
+                "output_detection",
+                input_detection,
+                output_detection,
+                model_response,
+                rag_info,
+            )
         return DefendOutcome(
-            output_result.is_safe, None, input_detection, output_detection, model_response, rag_info
+            True, None, input_detection, output_detection, model_response, rag_info
         )
 
     def stream_detect(
@@ -632,6 +652,10 @@ class DefenseService:
         -> ``done``（提前终止时省略中间事件，直接给 ``done``）。分支、拦截、降级、
         高置信跳过等语义与 ``detect`` 完全一致；异常类型也一致
         （``ServiceBusyError`` / ``DetectionError``），由上层转成 SSE ``error`` 事件。
+
+        输出检测判不安全时 ``done.stopped_at="output_detection"``：此时 ``delta`` 已全部
+        发出，**服务端无法撤回**，故由前端在收到 ``output_detection`` 事件后立即用拦截
+        文案替换气泡内容（这就是"先流式、结果出来再替换"的实现方式）。
         """
         # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
         try:
@@ -734,9 +758,19 @@ class DefenseService:
             "total_rules": output_result.total_rules,
         }
         yield "output_detection", output_detection
+
+        # 输出不安全 -> stopped_at="output_detection"。注意：此刻 ``delta`` 已全部
+        # 推给客户端，无法撤回已发送的文本，只能在收到本事件后由前端替换展示。
+        stopped_at = None if output_result.is_safe else "output_detection"
+        if stopped_at is not None:
+            logger.warning(
+                "[输出拦截] stopped_at=output_detection（命中类别: %s / 共 %s 条规则）",
+                ", ".join(output_result.failed_rules) or "未给出",
+                output_result.total_rules,
+            )
         yield "done", {
             "is_safe": output_result.is_safe,
-            "stopped_at": None,
+            "stopped_at": stopped_at,
             "model_response": model_response,
         }
 

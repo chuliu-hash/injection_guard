@@ -157,6 +157,7 @@ def inference_env_name(service: Optional[str], name: str) -> str:
 
 
 # 检测服务（输入 / 输出）与它们的默认判定输出长度（token）——见 InferenceSettings.for_service。
+# 判定输出很短（如 ``unsafe\\nS5``），16 足够覆盖换行与 S 编码。
 _DETECTION_SERVICES = ("input", "output")
 _DETECTION_MAX_NEW_TOKENS = 16
 

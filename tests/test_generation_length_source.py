@@ -29,11 +29,10 @@ def test_output_detection_client_sends_no_max_tokens() -> None:
         chat=SimpleNamespace(completions=_FakeCompletions())
     )
 
-    rule_id, is_safe = detector._check_single_rule(
-        "user text", "answer text", {"id": "r1", "critique_request": "x"}
-    )
+    detector.rules = [{"id": "S1", "critique_request": "x"}]
+    result = detector.detect("user text", "answer text")
 
-    assert (rule_id, is_safe) == ("r1", True)
+    assert result.is_safe is True
     # 生成长度交给服务端；客户端不再传 max_tokens
     assert "max_tokens" not in captured
     # 检测仍需确定性，temperature 保留

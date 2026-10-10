@@ -65,7 +65,7 @@ src/
 | `input_detection` | `{is_safe, risk_level, category, confidence, p_safe, p_attack, decision_by}` |
 | `rag` | `{enabled, final_prompt, retrieved_contexts:[{prompt,response}]}` |
 | `delta` | `{content}`（多次） |
-| `output_detection` | `{is_safe, failed_rules, total_rules}` |
+| `output_detection` | `{is_safe, failed_rules, total_rules}`（12 条规则单次判定；`failed_rules` = 命中类别编码如 `["S5"]`） |
 | `done` | `{is_safe, stopped_at, model_response}` |
 | `error` | `{error}`（`service_busy` 或异常文本） |
 

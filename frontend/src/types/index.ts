@@ -41,7 +41,7 @@ export interface DefendResponse {
   output_detection: OutputDetection | null
 }
 
-export type StoppedAt = 'input_detection' | 'output_skipped' | null
+export type StoppedAt = 'input_detection' | 'output_detection' | 'output_skipped' | null
 
 /** SSE `done` 事件的负载。 */
 export interface DonePayload {

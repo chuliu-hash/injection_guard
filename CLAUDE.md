@@ -13,7 +13,7 @@ Embedding 推理服务。全部代码在 `src/injection_guard/` 包内，统一�
 - **推理服务**（`services/llm_server.py` :8094/:8095/:8097、`services/embed_server.py` :8096）—— OpenAI 兼容的本地
   LLM 与 Embedding 服务，被防御 API 与 RAG 模块调用。其中 :8097 是**普通聊天模型**，用于生成 `model_response`；
   `llm_server` 支持 `stream=true` 的 SSE 流式输出。
-- **检测核心**（`defense/`）—— 纯逻辑：BERT 组 + LLM 复审（输入）、宪法规则并发检查（输出）、RAG。
+- **检测核心**（`defense/`）—— 纯逻辑：BERT 组 + LLM 复审（输入）、宪法规则整体判定（输出，单次调用）、RAG。
 - **聊天客户端**（`services/chat_client.py`）—— 调普通聊天接口生成回复（OpenAI SDK + base_url），含 `complete()` 与 `stream()`。
 - **Web 前端**（`frontend/`）—— Vue 3 + Vite + TS + Pinia + Element Plus 聊天助手，接入护栏（流式）；构建产物由防御 API 托管。
 
@@ -27,14 +27,14 @@ injection-guard-defense
 uvicorn injection_guard.api.app:create_app --factory --host 0.0.0.0 --port 8099
 
 # 输入检测 LLM（默认 localhost:8094；--service 决定读 configs/services.env 的哪一块推理参数）
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen_prompt_injection --port 8094 --service input
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/Qwen_prompt_injection --port 8094 --service input
 
-# 输出检测 LLM（默认 :8095）
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen3-8B --port 8095 --service output
+# 输出检测 LLM（默认 :8095；权重路径以 configs/deploy.env 的 OUTPUT_MODEL_PATH 为准）
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/Qwen3-8b --port 8095 --service output
 
-# 普通聊天 LLM（默认 :8097，请求未带 model_response 时用于生成）
+# 普通聊天 LLM（默认 :8097，请求未带 model_response 时用于生成；权重路径见 CHAT_MODEL_PATH）
 # 可用云端：在 .env 配 CHAT_API_URL + CHAT_API_KEY + CHAT_MODEL，则无需本地部署该服务
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen3-8B --port 8097 --service chat
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/<聊天模型> --port 8097 --service chat
 
 # Embedding（默认 :8096，RAG 增强所需）
 python -m injection_guard.cli.serve_embed --model_path Qwen3-Embedding-0.6B --port 8096
@@ -101,7 +101,7 @@ npm run lint && npm run type-check && npm test
 │    输入检测 ──►（可选 RAG 增强）──► 聊天生成 ──► 输出检测（可跳过）       │
 │      │                │                  │              │                │
 │      ▼                ▼                  ▼              ▼                │
-│  BERT集成+LLM复审  Embedding 检索     普通聊天 LLM   宪法规则并发检查     │
+│  BERT集成+LLM复审  Embedding 检索     普通聊天 LLM   宪法规则整体判定    │
 └──────┼────────────────┼──────────────────┼──────────────┼────────────────┘
        ▼                ▼                  ▼              ▼
   输入检测 LLM(:8094) Embedding(:8096)  聊天 LLM(:8097) 输出检测 LLM(:8095)
@@ -161,16 +161,23 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
    （**仍返回 `model_response`**）。跳过策略由请求体 `skip_output_when_high_confidence` /
    `safe_skip_threshold` 指定（前端设置面板），缺省取启动默认值
    （`SKIP_OUTPUT_WHEN_HIGH_CONFIDENCE=true` / `SAFE_SKIP_THRESHOLD=0.5`）—— `_resolve_skip_policy`。
-6. 否则执行**输出检测**（"User Input" 用原始 `user_input`），`stopped_at=None`。
+6. 否则执行**输出检测**（"User Input" 用原始 `user_input`）：判定不安全 → `stopped_at="output_detection"`；
+   判定安全 → `stopped_at=None`。
 7. 获取并发名额超时 → 抛 `ServiceBusyError` → HTTP `503 {"error": "service_busy"}`；
    检测/生成链路内部异常 → `DetectionError` → HTTP `500 {"error": ...}`。
 
 响应体为**完整详情**：`{is_safe, stopped_at, model_response, input_detection, rag, output_detection}`
-（`stopped_at` 走完全流程时为 `null`；`rag` 未启用或降级时为 `null`）。
+（`stopped_at` 取 `input_detection` / `output_detection` / `output_skipped`，走完全流程且输出检测通过时为 `null`；
+`rag` 未启用或降级时为 `null`）。
+
+`model_response` 一律**原样返回**，不替换成拦截文案：调用方传了 `model_response` 时那是"待检测的文本"，
+替换会破坏纯检测用法；流式路径下文本也已发出、无从撤回。**是否拦截展示由前端按 `stopped_at` 决定**。
 
 `DefenseService.stream_detect(...)` 是同一套分支的**同步生成器**版本：逐条 `yield (event, data)`，复用
 `_run_input_detection_guarded` / `_run_rag` / `_run_chat_stream_guarded` / `_run_output_detection_guarded`；
-请求带了 `model_response` 时不发 `delta`。`api/routes.py:/api/chat_stream` 用 `async def` + `StreamingResponse`，
+请求带了 `model_response` 时不发 `delta`。输出判不安全时 `done.stopped_at="output_detection"`——此时 `delta`
+已全部发出，**服务端撤回不了已发送的文本**，只能由前端在 `output_detection` 事件到达时立即用拦截文案替换气泡
+内容（这就是「先流式、检测结果出来再中断替换」的实现方式；`/api/prompt_defend` 语义一致但无此限制）。`api/routes.py:/api/chat_stream` 用 `async def` + `StreamingResponse`，
 在**工作线程**里跑该生成器、经 `asyncio.Queue` + `loop.call_soon_threadsafe` 桥回事件循环，并每 15s 发 `: ping` 心跳；
 客户端断开时 `finally: gen.close()` 保证 `chat_sem` 释放。
 
@@ -233,10 +240,21 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
 
 ### 输出检测（`defense/safety_detector.py`）
 
-- 用 `openai` Python SDK（非原生 requests）调用 OpenAI 兼容 API。
-- 加载 `settings.critique_requests_path`（默认 `resources/CritiqueRequests.json`，当前 5 条规则）。
-- 每条规则独立调用 LLM，只要求输出 `safe`/`unsafe`；用**持久化** `ThreadPoolExecutor`（max_workers=max(规则数,4)）并发执行。
-- 任一规则不通过即判定不安全；解析不到 `safe`/`unsafe` 或异常时**默认放行**（返回安全）。
+- 用 `openai` Python SDK（非原生 requests）调用 OpenAI 兼容 API；固定 `temperature=0.0`。
+- 加载 `settings.critique_requests_path`（默认 `resources/CritiqueRequests.json`，当前 **12 条**规则，
+  即风险类别 S1~S12，与 `defense/risk_mapping.py:CATEGORY_NAMES` 同名；每条为**中英双语**描述，
+  便于匹配英文内容）。
+- **12 条规则只调用一次 LLM**：规则清单拼进 system prompt（`_format_rules()` → `{rules}`），
+  模型回 `safe` 或 `unsafe` + 换行 + 类别编码（`unsafe\nS5`）；`total_rules` = 规则条数（12）。
+- **归因**：判不安全时用 `_CATEGORY_RE`（`S\d{1,2}`）从回复里取编码、限定在已加载规则内、去重，
+  填进 `DetectionResult.failed_rules`（如 `["S5"]`）；模型只回 `unsafe` 没给类别时为空列表，
+  **判定仍是不安全**。前端「输出检测」展示 `命中类别`。
+- **解析保持改动前的语义**：回复含 `unsafe` → 不安全；否则含 `safe` → 安全；都不含 → 默认放行（记 warning）。
+- **异常默认放行**：调用失败（服务不可达 / 超时 / 返回体异常）记 warning 并判为安全（改动前语义）。
+- `SYSTEM_PROMPT_TEMPLATE` 是**中英双语**分类器模板（**raw 字符串**，故 `\n` 字面量原样写进提示词）：
+  角色 + 【语言要求】（中/英/混排一律判定，别因是英文就放过）+ 【安全规则】清单 + 【举例】（中英各若干）
+  + 【输出要求】（只输出 `safe` / `unsafe\nS 编码`）；
+  `USER_PROMPT_TEMPLATE` 保持 `<BEGIN_INPUT>` / `<BEGIN_RESPONSE>` 结构，`[User Input]` 用**原始 `user_input`**。
 - 参数优先级：**显式传入的参数 > settings**（与旧版「env 优先于参数」相反）；`api_key` 同样如此
   （留空 → settings → 占位串 `"EMPTY"`，见「聊天客户端」）。
 
@@ -269,7 +287,8 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
   因此这些**不**在 `Settings` 中声明；静态可调项（队列大小、token 上限等）走 `InferenceSettings`，
   按 `--service`（input/output/chat）加前缀读取 `configs/services.env`（见「Configuration」）。
   **生成长度来源**：输入 / 输出检测的客户端**不发送** `max_tokens`，长度由 `for_service` 的**内置默认**
-  `api_server_max_new_tokens = 16` 决定（无需写进 `services.env`）；聊天客户端发送 `max_tokens`（来自请求体 /
+  `api_server_max_new_tokens = 16` 决定（判定输出很短，16 覆盖 `unsafe` + 换行 + S 编码；
+  无需写进 `services.env`）；聊天客户端发送 `max_tokens`（来自请求体 /
   前端设置面板，缺省回落 `Settings.CHAT_MAX_TOKENS`），且聊天服务端**不设上限**（该字段默认 `None`）。
   三者均可用 `<服务>_API_SERVER_MAX_NEW_TOKENS` 覆盖；服务端若设置了上限，则与请求值取 `min`
   （`_prepare_generation`）。
@@ -347,7 +366,7 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
 
 | 文件 | 用途 |
 |------|------|
-| `resources/CritiqueRequests.json` | 输出检测的宪法规则（5 条），`{"critique_requests": [...]}` 格式 |
+| `resources/CritiqueRequests.json` | 输出检测的宪法规则（12 条，即风险类别 S1~S12），`{"critique_requests": [...]}` 格式 |
 | `resources/jailbreak_prompts.json`（`RAG_DB_PATH`） | RAG 知识库源文件，每条含 `prompt` 和 `safe_response` |
 | `<RAG_DB_PATH 同目录同主名>.pt` | RAG 向量库缓存（文本+向量）；存在则加载，否则首次运行自动从 JSON 重构 |
 | `<BERT_MODEL_DIR>/` | 若干 BERT 分类模型子目录（每个含 `config.json`，**自动扫描加载**，无需登记名单） |
@@ -364,6 +383,9 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
 `tests/` 下用 pytest：
 
 - `test_confidence_vote.py` / `test_risk_mapping.py` / `test_url_utils.py`：纯函数断言。
+- `test_safety_detector.py`：单次调用（12 条规则进同一个 system prompt）、判定词解析
+  （`unsafe` 优先 / 大小写与标点 / 解析不出默认放行）、类别归因（`unsafe\nS5` → `["S5"]`、
+  去重 / 未知编码丢弃 / 只回 unsafe 时无归因）、异常默认放行、无规则时安全且不调 LLM。
 - `test_clients_api_key.py`：`ChatClient` / `SafetyDetector` 的 api_key 选择逻辑（留空 → `"EMPTY"`，显式 key 优先；不发网络请求）。
 - `test_connectivity.py`：`services/connectivity.py` 的目标派生 / 超时归一 / `probe` / `check_services`
   （monkeypatch `_invoke`、`probe`，不发网络请求）。
@@ -371,8 +393,10 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
   注入**桩 DefenseService**（不加载真实模型），覆盖健康检查、输入拦截、高置信跳过、走完输出检测、
   缺字段→400 `{"error":...}`、繁忙→503、检测异常→500、连通性测试（子集 / 未知名→400 / timeout 越界→400）。
 - `test_pipeline.py`：`DefenseService.detect` 编排（子类化 + 桩替换各步骤），覆盖 RAG 开/关、RAG 降级、
-  请求带 `model_response` 跳过聊天、高置信跳过、输出检测用原始 `user_input`。
-- `test_stream_pipeline.py`：`DefenseService.stream_detect` 的事件序列（子类化 + 桩替换各步骤）。
+  请求带 `model_response` 跳过聊天、高置信跳过、输出检测用原始 `user_input`、
+  输出不安全 → `stopped_at="output_detection"`。
+- `test_stream_pipeline.py`：`DefenseService.stream_detect` 的事件序列（子类化 + 桩替换各步骤），
+  含输出不安全时 `delta` 先发完、`done` 以 `stopped_at="output_detection"` 收尾。
 - `test_stream_api.py`：`TestClient` 打 `/api/chat_stream`，断言 `text/event-stream`、事件序列、缺字段→400 JSON、繁忙→`error` 事件。
 
 前端用 Vitest（`cd frontend && npm test`，jsdom 环境）：`api/sse.spec.ts`（分帧解析）、`stores/session.spec.ts`（会话 CRUD）、

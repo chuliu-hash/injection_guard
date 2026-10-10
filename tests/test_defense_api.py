@@ -198,7 +198,7 @@ def test_high_confidence_skips_output_but_returns_response():
 
 
 def test_full_pipeline_returns_both_detections_and_rag():
-    output = {"is_safe": True, "failed_rules": [], "total_rules": 5}
+    output = {"is_safe": True, "failed_rules": [], "total_rules": 12}
     rag = {
         "enabled": True,
         "final_prompt": "Safe Example 1 ...",
@@ -212,7 +212,7 @@ def test_full_pipeline_returns_both_detections_and_rag():
     assert body["stopped_at"] is None
     assert body["model_response"] == "模型回复"
     assert body["input_detection"]["is_safe"] is True
-    assert body["output_detection"]["total_rules"] == 5
+    assert body["output_detection"]["total_rules"] == 12
     assert body["output_detection"]["failed_rules"] == []
     assert body["rag"]["enabled"] is True
     assert body["rag"]["retrieved_contexts"][0]["response"] == "r"

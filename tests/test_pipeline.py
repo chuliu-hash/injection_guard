@@ -40,7 +40,7 @@ class _StubService(DefenseService):
         self.settings = settings
         self._input_result = input_result
         self._output_result = output_result or SimpleNamespace(
-            is_safe=True, failed_rules=[], total_rules=5
+            is_safe=True, failed_rules=[], total_rules=12
         )
         self._rag_result = rag_result
         self._rag_exc = rag_exc
@@ -175,3 +175,26 @@ def test_output_detection_uses_original_user_input():
     assert outcome.stopped_at is None
     assert svc.output_calls[0]["text"] == "原始输入"
     assert svc.output_calls[0]["answer"] == "REPLY"
+
+
+def test_output_unsafe_marks_stopped_at_output_detection():
+    """输出检测判不安全 -> stopped_at="output_detection"，model_response 原样返回。"""
+    svc = _StubService(
+        _settings(),
+        input_result=SAFE_INPUT,
+        output_result=SimpleNamespace(
+            is_safe=False, failed_rules=["S5"], total_rules=12
+        ),
+    )
+    outcome = svc.detect(user_input="你好")
+    assert outcome.is_safe is False
+    assert outcome.stopped_at == "output_detection"
+    assert outcome.model_response == "REPLY"
+    assert outcome.output_detection["failed_rules"] == ["S5"]
+
+
+def test_output_safe_keeps_stopped_at_none():
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    outcome = svc.detect(user_input="你好")
+    assert outcome.is_safe is True
+    assert outcome.stopped_at is None

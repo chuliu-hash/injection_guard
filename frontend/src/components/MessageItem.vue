@@ -18,7 +18,12 @@ const isAssistant = computed(() => props.message.role === 'assistant')
 const renderedHtml = computed(() =>
   props.renderMd && isAssistant.value ? renderMarkdown(props.message.content) : '',
 )
-const blocked = computed(() => props.detection?.stoppedAt === 'input_detection')
+// 输入检测拦截（未生成）与输出检测拦截（已生成、事后替换）都用拦截样式
+const blocked = computed(
+  () =>
+    props.detection?.stoppedAt === 'input_detection' ||
+    props.detection?.stoppedAt === 'output_detection',
+)
 </script>
 
 <template>

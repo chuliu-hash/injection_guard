@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 
 import { useSessionStore } from '@/stores/session'
-import type { DetectionRecord } from '@/types'
+import type { ChatMessage, DetectionRecord } from '@/types'
 import { formatTime, truncate } from '@/utils/format'
 
 import DetectionPanel from './DetectionPanel.vue'
@@ -25,16 +25,28 @@ interface RecordItem {
   record: DetectionRecord
 }
 
+/** 该助手回合对应的用户输入：向前找最近的一条 user 消息。
+ *  检测记录针对的是**用户输入**，预览理应显示它，而非模型回答。
+ *  （ChatView.send 总是先追加 user 再追加 assistant，故必然能配到。） */
+function userInputBefore(messages: ChatMessage[], index: number): string {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (messages[i].role === 'user') return messages[i].content
+  }
+  return ''
+}
+
 const items = computed<RecordItem[]>(() => {
   const session = store.sessions.find((s) => s.id === props.sessionId)
   if (!session) return []
-  return session.messages
-    .filter((m) => m.role === 'assistant' && session.detections[m.id])
-    .map((m) => ({
-      id: m.id,
-      createdAt: m.createdAt,
-      preview: truncate(m.content, 40),
-      record: session.detections[m.id],
+  const messages = session.messages
+  return messages
+    .map((message, index) => ({ message, index }))
+    .filter(({ message }) => message.role === 'assistant' && session.detections[message.id])
+    .map(({ message, index }) => ({
+      id: message.id,
+      createdAt: message.createdAt,
+      preview: truncate(userInputBefore(messages, index), 40),
+      record: session.detections[message.id],
     }))
     .reverse()
 })

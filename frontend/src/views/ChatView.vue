@@ -33,6 +33,7 @@ const messages = computed(() => session.value?.messages ?? [])
 const detections = computed(() => session.value?.detections ?? {})
 
 const BLOCKED_TEXT = '该消息未通过安全检测，已被拦截。'
+const OUTPUT_BLOCKED_TEXT = '该回复未通过输出安全检测，已被拦截。'
 
 onMounted(() => {
   const param = route.params.sessionId
@@ -99,6 +100,12 @@ async function send(rawText: string): Promise<void> {
           const payload = data as OutputDetection
           record.outputDetection = payload
           record.isSafe = payload.is_safe
+          // 输出不安全：此时流式 token 已全部收到，服务端撤回不了，只能在此
+          // 「检测结果一出来就中断」——立即用拦截文案替换气泡内容。
+          if (!payload.is_safe) {
+            record.stoppedAt = 'output_detection'
+            store.patchMessage(sessionId, assistant.id, { content: OUTPUT_BLOCKED_TEXT })
+          }
         } else if (event === 'done') {
           const payload = data as DonePayload
           record.isSafe = payload.is_safe

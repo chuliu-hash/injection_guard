@@ -83,9 +83,9 @@ class RagResult(BaseModel):
 class DefendResponse(BaseModel):
     """防御流水线的完整响应。
 
-    ``stopped_at`` 仅在提前终止时非空（``input_detection`` / ``output_skipped``）；
-    走完全流程时为 ``null``。``model_response`` 为本次实际使用的模型回复
-    （请求提供或由聊天接口生成）。
+    ``stopped_at`` 仅在提前终止时非空（``input_detection`` / ``output_detection`` /
+    ``output_skipped``）；走完全流程且输出检测通过时为 ``null``。``model_response``
+    为本次实际使用的模型回复（请求提供或由聊天接口生成），**不因输出不安全而被替换**。
     """
 
     is_safe: bool

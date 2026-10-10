@@ -20,6 +20,11 @@ user_input ─► 输入检测 ─►（可选 RAG 增强 → final_prompt）─
 - 请求带 `model_response` 时**跳过聊天调用**（兼容旧「纯检测」用法）；未带则由聊天接口生成。
 - 输入不安全 → 直接拦截（`stopped_at="input_detection"`）。
 - 输入安全且高置信 → 可跳过输出检测（`stopped_at="output_skipped"`，仍返回 `model_response`）。
+- 输出检测判不安全 → `stopped_at="output_detection"`（`model_response` 原样返回，由前端替换展示）。
+- 输出检测用 `resources/CritiqueRequests.json` 的 **12 条宪法规则**（风险类别 S1~S12，中英双语），
+  **一次 LLM 调用**整体判定（内容中/英/混排均可），模型回 `safe` 或 `unsafe` + 换行 + 类别编码（如 `unsafe\nS5`）；
+  编码即命中类别（`failed_rules`，如 `["S5"]`；模型没给类别时为空但判定仍是不安全）。
+  调用失败或回复解析不出判定词时**默认放行**（记 warning）。
 - RAG 增强由请求体 `use_rag` 控制（缺省取启动默认 `ENABLE_RAG=false`）；Embedding 不可用时**降级继续**。
 - 所有下游服务配置统一为 **base URL**（`http://host:port/v1`），端点路径由 `url_utils.join_endpoint` 拼接。
 
@@ -56,14 +61,14 @@ injection-guard-defense
 uvicorn injection_guard.api.app:create_app --factory --host 0.0.0.0 --port 8099
 
 # 输入检测 LLM（默认 localhost:8094；--service 决定读 configs/services.env 的哪一块推理参数）
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen_prompt_injection --port 8094 --service input
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/Qwen_prompt_injection --port 8094 --service input
 
-# 输出检测 LLM（默认 :8095）
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen3-8B --port 8095 --service output
+# 输出检测 LLM（默认 :8095；权重路径以 configs/deploy.env 的 OUTPUT_MODEL_PATH 为准）
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/Qwen3-8b --port 8095 --service output
 
-# 普通聊天 LLM（默认 :8097，用于生成 model_response）
+# 普通聊天 LLM（默认 :8097，用于生成 model_response；权重路径见 CHAT_MODEL_PATH）
 # 也可用云端：在 .env 配 CHAT_API_URL + CHAT_API_KEY + CHAT_MODEL，则无需本地部署
-python -m injection_guard.cli.serve_llm --model_path ./model/LLMS/Qwen3-8B --port 8097 --service chat
+python -m injection_guard.cli.serve_llm --model_path ./models/LLM/<聊天模型> --port 8097 --service chat
 
 # Embedding（默认 :8096，RAG 增强所需）
 python -m injection_guard.cli.serve_embed --model_path Qwen3-Embedding-0.6B --port 8096
@@ -102,6 +107,7 @@ npm run lint && npm run type-check && npm test
 ```
 
 - 逐字流式输出；输入检测 / RAG 增强 / 输出检测结果**不内联显示**，统一在会话级「检测记录」抽屉查看；
+- 输出检测判不安全时，收到 `output_detection` 事件即刻用拦截文案替换该条气泡（「先流式、结果出来再替换」）；
 - RAG 开关、多会话历史（浏览器 localStorage 持久化）；
 - 设置页「服务连通性」：一键测试输入 / 输出 / RAG / 聊天四个模型服务的连接与可用性。
 
@@ -130,6 +136,8 @@ curl -X POST localhost:8099/api/test_services -H 'Content-Type: application/json
   聊天服务端**不设生成长度上限**）；`safe_skip_threshold` / `skip_output_when_high_confidence`
   （可选，输出检测跳过策略，缺省取后端默认）。
 - `/api/prompt_defend` 响应：`{is_safe, stopped_at, model_response, input_detection, rag, output_detection}`。
+  `stopped_at` 取 `input_detection` / `output_detection` / `output_skipped`，走完全流程且输出检测通过时为 `null`。
+  `model_response` **不因输出不安全而被替换**（那是"待检测的文本"，替换会破坏纯检测用法）。
 - `/api/chat_stream` 响应为 `text/event-stream`，事件见下表；校验失败时返回普通 `400 {"error": ...}`。
 - 错误一律 `{"error": ...}`：缺字段 → `400`；检测/生成异常 → `500`；并发繁忙 → `503 {"error":"service_busy"}`。
 - `/api/test_services`（**连通性测试**，诊断用）：请求体可省略；可指定 `services`
@@ -144,8 +152,8 @@ curl -X POST localhost:8099/api/test_services -H 'Content-Type: application/json
 | `input_detection` | `{is_safe, risk_level, category, confidence, p_safe, p_attack, decision_by, sensitivity}` |
 | `rag` | `{enabled, final_prompt, retrieved_contexts:[{prompt,response}]}` |
 | `delta` | `{content}`（多次） |
-| `output_detection` | `{is_safe, failed_rules, total_rules}` |
-| `done` | `{is_safe, stopped_at, model_response}` |
+| `output_detection` | `{is_safe, failed_rules, total_rules}`（12 条规则单次判定；`failed_rules` = 模型给出的命中类别编码） |
+| `done` | `{is_safe, stopped_at, model_response}`（`stopped_at` 见上；输出不安全时为 `output_detection`） |
 | `error` | `{error}`（`service_busy` 或异常文本） |
 
 ## 配置

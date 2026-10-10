@@ -40,7 +40,7 @@ class _StubService(DefenseService):
         self.settings = settings
         self._input_result = input_result
         self._output_result = output_result or SimpleNamespace(
-            is_safe=True, failed_rules=[], total_rules=5
+            is_safe=True, failed_rules=[], total_rules=12
         )
         self._rag_result = rag_result
         self._rag_exc = rag_exc
@@ -171,3 +171,30 @@ def test_provided_response_skips_chat_and_delta():
     assert "delta" not in _names(events)
     assert svc.chat_prompts == []
     assert events[-1][1]["model_response"] == "已有回复"
+
+
+def test_output_unsafe_marks_done_stopped_at_output_detection():
+    """输出不安全：delta 已发完，done 以 stopped_at="output_detection" 收尾。"""
+    svc = _StubService(
+        _settings(),
+        input_result=SAFE_INPUT,
+        output_result=SimpleNamespace(
+            is_safe=False, failed_rules=["S5"], total_rules=12
+        ),
+    )
+    events = _collect(svc, user_input="你好")
+
+    # delta 仍在 output_detection 之前全部发出（这是「先流式」的固有语义）
+    assert _names(events) == [
+        "input_detection",
+        "rag",
+        "delta",
+        "delta",
+        "output_detection",
+        "done",
+    ]
+    assert events[-2][1]["is_safe"] is False
+    assert events[-1] == (
+        "done",
+        {"is_safe": False, "stopped_at": "output_detection", "model_response": "REPLY"},
+    )

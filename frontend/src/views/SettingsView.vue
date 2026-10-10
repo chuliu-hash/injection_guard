@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { testServices } from '@/api/defense'
@@ -9,8 +9,6 @@ import type { ServiceKey, ServiceProbeResult } from '@/types'
 
 const settings = useSettingsStore()
 const session = useSessionStore()
-
-const apiBase = computed(() => import.meta.env.VITE_API_BASE_URL || '（同源，由后端托管）')
 
 // ── 服务连通性 ──────────────────────────────────────────────
 /** 固定展示顺序（与后端 SERVICE_KEYS 一致）。 */
@@ -56,11 +54,6 @@ async function clearAll(): Promise<void> {
   <div class="settings">
     <h3>设置</h3>
     <el-form label-width="150px">
-      <el-form-item label="后端地址">
-        <el-tag type="info">{{ apiBase }}</el-tag>
-
-      </el-form-item>
-
       <el-form-item label="服务连通性">
         <el-button type="primary" :loading="probing" @click="runProbe">测试连接</el-button>
         <span class="hint">对输入/输出/RAG/聊天四个模型各发一次最小请求</span>

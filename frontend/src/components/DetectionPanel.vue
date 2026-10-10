@@ -16,6 +16,8 @@ const stoppedLabel = computed(() => {
   switch (props.record.stoppedAt) {
     case 'input_detection':
       return '输入检测拦截'
+    case 'output_detection':
+      return '输出检测拦截'
     case 'output_skipped':
       return '高置信跳过输出检测'
     default:
@@ -23,11 +25,6 @@ const stoppedLabel = computed(() => {
   }
 })
 
-const passedRules = computed(() => {
-  const total = output.value?.total_rules ?? 0
-  const failed = output.value?.failed_rules?.length ?? 0
-  return total - failed
-})
 </script>
 
 <template>
@@ -108,10 +105,11 @@ const passedRules = computed(() => {
         <el-descriptions-item label="是否安全">
           <RiskTag :safe="output.is_safe" />
         </el-descriptions-item>
-        <el-descriptions-item label="规则通过">
-          {{ passedRules }} / {{ output.total_rules }}
+        <el-descriptions-item label="宪法规则">
+          {{ output.total_rules }} 条 · 单次调用整体判定
         </el-descriptions-item>
-        <el-descriptions-item v-if="output.failed_rules?.length" label="未通过规则">
+        <!-- 命中类别（S 编码）：模型没给出类别时该行不显示，判定仍是不安全 -->
+        <el-descriptions-item v-if="output.failed_rules?.length" label="命中类别">
           <el-tag
             v-for="rule in output.failed_rules"
             :key="rule"
