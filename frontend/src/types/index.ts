@@ -1,5 +1,8 @@
 /** 与后端 `api/schemas.py` 及 SSE 事件契约对应的类型定义。 */
 
+/** 输入检测敏感度档位（对应后端 `config.SENSITIVITY_LEVELS`）。 */
+export type SensitivityLevel = 'low' | 'medium' | 'high'
+
 export interface InputDetection {
   is_safe: boolean
   risk_level: string
@@ -8,6 +11,8 @@ export interface InputDetection {
   p_safe: number
   p_attack: number
   decision_by: string
+  /** 本次实际生效的敏感度档位（请求未指定时即后端默认值）。 */
+  sensitivity?: SensitivityLevel
 }
 
 export interface OutputDetection {
@@ -87,15 +92,43 @@ export interface ChatSession {
 export interface ChatStreamRequest {
   user_input: string
   use_rag?: boolean
+  /** 输入检测敏感度（设置面板提供；缺省由后端的 DEFAULT_SENSITIVITY 决定）。 */
+  sensitivity?: SensitivityLevel
   model_response?: string
+  /** 聊天生成参数（设置面板提供；缺省由后端的 Settings 默认值决定）。 */
+  temperature?: number
+  max_tokens?: number
+  /** 输出检测跳过策略（设置面板提供；缺省由后端 Settings 默认值决定）。 */
+  safe_skip_threshold?: number
+  skip_output_when_high_confidence?: boolean
 }
 
 export interface HealthInfo {
   status: string
-  fixed_sensitivity: string
+  default_sensitivity: SensitivityLevel
   input_max_concurrency: number
   output_max_concurrency: number
   chat_max_concurrency: number
   enable_rag: boolean
   [key: string]: unknown
+}
+
+/** 可测试的下游模型服务键（与后端 connectivity.SERVICE_KEYS 一致）。 */
+export type ServiceKey = 'input' | 'output' | 'rag' | 'chat'
+
+export interface ServiceProbeResult {
+  ok: boolean
+  label: string
+  url: string
+  model: string
+  latency_ms?: number | null
+  /** 仅 ok=false 时非空。 */
+  error?: string | null
+}
+
+export interface TestServicesResponse {
+  /** 本次选中的所有服务是否全部通过。 */
+  ok: boolean
+  timeout: number
+  services: Partial<Record<ServiceKey, ServiceProbeResult>>
 }

@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..config import get_settings
+from ..config import InferenceSettings, get_inference_settings
 from .gpu import assign_process_gpu, parse_gpu_ids
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,13 @@ _request_timeout: float = 300.0
 _model_config: dict = {}  # 模型加载配置（由 configure_model 设置）
 _load_lock = None
 _completed_requests = 0
+_service: Optional[str] = None  # 服务名（input/output/chat），决定读取 configs/services.env 的前缀
+
+
+def _inference_settings() -> InferenceSettings:
+    """取当前服务的推理配置（按服务前缀）；多 worker 子进程经环境变量继承服务名。"""
+    return get_inference_settings(_service or os.environ.get("API_SERVER_SERVICE"))
+
 
 app = FastAPI(title="LLM API with Logprobs", version="2.0.0")
 
@@ -117,7 +124,7 @@ def _maybe_empty_cuda_cache(force: bool = False) -> None:
     if not torch.cuda.is_available():
         return
 
-    settings = get_settings()
+    settings = _inference_settings()
     _completed_requests += 1
     every = max(0, settings.api_server_empty_cache_every)
     should_clear = force or settings.api_server_empty_cache_after_request
@@ -133,10 +140,12 @@ def configure_model(
     base_model_path: Optional[str] = None,
     lora_path: Optional[str] = None,
     request_timeout: float = 300,
+    service: Optional[str] = None,
 ) -> None:
     """存储模型加载配置。各 worker 首次请求时按此配置懒加载模型。
 
     多 worker 模式下，配置通过环境变量传递给子进程（避免 fork/spawn 丢失）。
+    ``service`` 决定推理参数从 ``configs/services.env`` 读取的前缀（input/output/chat）。
     """
     # 环境变量方式：子进程无论 fork/spawn 都能继承
     os.environ["API_SERVER_MODE"] = mode or "full"
@@ -147,8 +156,10 @@ def configure_model(
     if lora_path:
         os.environ["API_SERVER_LORA_PATH"] = lora_path
     os.environ["API_SERVER_TIMEOUT"] = str(request_timeout or 300)
+    if service:
+        os.environ["API_SERVER_SERVICE"] = service
 
-    global _model_config, _request_timeout
+    global _model_config, _request_timeout, _service
     _model_config = {
         "mode": mode,
         "model_path": model_path,
@@ -156,6 +167,7 @@ def configure_model(
         "lora_path": lora_path,
     }
     _request_timeout = request_timeout
+    _service = service
 
 
 def _ensure_model_loaded() -> None:
@@ -194,7 +206,7 @@ def _select_worker_device() -> Optional[int]:
     if not torch.cuda.is_available():
         return None
 
-    settings = get_settings()
+    settings = _inference_settings()
     device_count = torch.cuda.device_count()
     gpu_ids = parse_gpu_ids(settings.api_server_gpu_ids, device_count)
     namespace = settings.api_server_gpu_namespace or f"api_server_{os.getppid()}"
@@ -215,7 +227,7 @@ def _load_model() -> None:
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    settings = get_settings()
+    settings = _inference_settings()
     pid = os.getpid()
     logger.info("[Worker %s] 开始加载模型 ...", pid)
 
@@ -361,7 +373,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        max_queue_size = get_settings().api_server_max_queue_size
+        max_queue_size = _inference_settings().api_server_max_queue_size
         if max_queue_size > 0 and _model_executor is not None:
             queue_size = (
                 _model_executor._work_queue.qsize() if hasattr(_model_executor, "_work_queue") else 0
@@ -411,8 +423,9 @@ def _prepare_generation(
     """
     model = _model
     tokenizer = _tokenizer
-    settings = get_settings()
+    settings = _inference_settings()
     max_input_tokens = settings.api_server_max_input_tokens
+    # None = 不设上限（生成长度完全由请求的 max_tokens 决定）
     max_new_tokens_limit = settings.api_server_max_new_tokens
 
     # 1. Chat Template
@@ -440,8 +453,13 @@ def _prepare_generation(
     input_length = inputs.input_ids.shape[1]
 
     # 3. 生成配置
-    requested_max_tokens = request.max_tokens or max_new_tokens_limit
-    max_new_tokens = min(requested_max_tokens, max_new_tokens_limit)
+    # 请求 max_tokens 优先；服务端上限（若设置）只作硬顶，None 表示不设上限
+    requested_max_tokens = request.max_tokens or max_new_tokens_limit or 1024
+    max_new_tokens = (
+        min(requested_max_tokens, max_new_tokens_limit)
+        if max_new_tokens_limit is not None
+        else requested_max_tokens
+    )
     temperature = request.temperature if request.temperature is not None else 0.7
     top_p = request.top_p if request.top_p is not None else 0.9
     do_sample = temperature > 0.0
@@ -658,6 +676,7 @@ def start_api_server(
     model_path: Optional[str] = None,
     base_model_path: Optional[str] = None,
     lora_path: Optional[str] = None,
+    service: Optional[str] = None,
 ) -> None:
     """启动高并发 OpenAI API 兼容服务。
 
@@ -669,6 +688,7 @@ def start_api_server(
         model_path: 模型路径（full mode 或 lora 的适配器路径）
         base_model_path: LoRA 模式下的基座模型路径
         lora_path: LoRA 适配器路径（默认取 model_path）
+        service: 服务名（input/output/chat），决定 configs/services.env 的推理参数前缀
     """
     configure_model(
         mode=mode,
@@ -676,6 +696,7 @@ def start_api_server(
         base_model_path=base_model_path,
         lora_path=lora_path,
         request_timeout=request_timeout,
+        service=service,
     )
 
     # workers=1 时预加载模型（首次请求不等待）

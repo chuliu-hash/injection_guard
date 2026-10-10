@@ -76,10 +76,13 @@ Prediction:
         self.base_url = base_url or settings.output_detector_api_url
         self.model_name = model_name or settings.output_detector_model
         self.request_timeout = settings.output_detector_timeout
-        self.max_tokens = settings.output_detector_max_tokens
+        # 生成长度不由此处指定：由推理服务按 --service output 的
+        # OUTPUT_API_SERVER_MAX_NEW_TOKENS 决定（客户端仅在聊天场景发送 max_tokens）。
+        # 本地服务无鉴权：留空即可；openai SDK 不接受空 key，故用占位串（本地服务忽略该头）。
+        self.api_key = api_key or settings.output_detector_api_key or "EMPTY"
 
         self.client = OpenAI(
-            api_key=api_key,
+            api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.request_timeout,
         )
@@ -133,7 +136,6 @@ Prediction:
                 model=self.model_name,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=self.max_tokens,
             )
             content = response.choices[0].message.content.strip().lower()
 

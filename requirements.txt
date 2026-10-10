@@ -8,7 +8,29 @@ pydantic-settings>=2.1
 openai>=1.0
 numpy
 requests
-torch
-transformers
+
+# ── 模型推理：以下为**已验证可共存**的版本组合，勿随意升级 ──────────────
+# 版本互相钳制，任一处变动都可能破坏推理（详见 CLAUDE.md「模型推理依赖」）：
+#   * transformers 5.x 运行时需要 torch>=2.6（用了 torch.accelerator）；
+#   * 而 GPTQ 加载要求 optimum + gptqmodel，gptqmodel 的预编译内核在
+#     torch 2.6 只有 cu126/cu128（本机 glibc 2.27 装不了其 manylinux_2_28 wheel），
+#     可用内核只到 torch 2.5 → 故 transformers 必须留在 4.x。
+#
+# torch 需为 CUDA 12.4 构建（PyPI 的 torch==2.5.1 即 cu124）。若改用 PyTorch 源：
+#   pip install --index-url https://download.pytorch.org/whl/cu124 "torch==2.5.1+cu124"
+torch==2.5.1
+transformers==4.55.2
+accelerate==1.10.0
+sentence-transformers==5.7.0
 peft
-sentence-transformers
+
+# GPTQ 量化模型加载：transformers 走 GptqHfQuantizer，需要 optimum + gptqmodel
+# （见 transformers/quantizers/quantizer_gptq.py）。gptqmodel 安装时由 setup.py
+# 按已装 torch/CUDA 拉取匹配的预编译内核（本机 → 2.2.0+cu124torch2.5）。
+optimum==1.27.0
+gptqmodel==2.2.0
+
+# gptqmodel 导入时会 import datasets；本机 glibc 2.27 只能用 pyarrow 18
+# （datasets>=5 要求 pyarrow>=24），故两者一并锁版本。
+datasets==3.6.0
+pyarrow==18.0.0

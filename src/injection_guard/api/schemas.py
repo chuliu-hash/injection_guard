@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -23,6 +23,19 @@ class DefendRequest(BaseModel):
     # RAG 增强开关（None 时取全局 ENABLE_RAG）
     use_rag: Optional[bool] = None
 
+    # 输入检测敏感度 low/medium/high（前端设置面板提供；None 时取全局 DEFAULT_SENSITIVITY）
+    sensitivity: Optional[str] = None
+
+    # 输出检测跳过策略（前端设置面板提供；None 时取 Settings 默认值）。
+    # ⚠️ 客户端可控 = 可自行关闭输出侧检测，属安全面削弱。
+    safe_skip_threshold: Optional[float] = None
+    skip_output_when_high_confidence: Optional[bool] = None
+
+    # 聊天生成参数（前端设置面板提供；None 时取 Settings 默认值）。
+    # 仅当请求未带 model_response（即需要本服务生成回复）时生效。
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
     # 输入检测器配置（仅首次初始化生效）
     input_llm_api_url: Optional[str] = None
     input_llm_api_model: Optional[str] = None
@@ -42,6 +55,8 @@ class InputDetectionResult(BaseModel):
     p_safe: float
     p_attack: float
     decision_by: str
+    # 本次实际生效的敏感度档位（请求未指定时即默认值）
+    sensitivity: Optional[str] = None
 
 
 class OutputDetectionResult(BaseModel):
@@ -79,3 +94,35 @@ class DefendResponse(BaseModel):
     input_detection: Optional[InputDetectionResult] = None
     rag: Optional[RagResult] = None
     output_detection: Optional[OutputDetectionResult] = None
+
+
+class TestServicesRequest(BaseModel):
+    """``POST /api/test_services`` 的请求体（可省略整个 body）。
+
+    校验（未知服务名 / 空列表 / timeout 越界）由路由层处理，以返回
+    ``400 {"error": ...}``，与其它接口风格一致。
+    """
+
+    # 要测试的服务键：input / output / rag / chat；缺省全部
+    services: Optional[List[str]] = None
+    # 每个探测的超时（秒）；缺省 5.0，范围 0.5~60
+    timeout: Optional[float] = None
+
+
+class ServiceProbeResult(BaseModel):
+    """单个下游服务的探测结果。``error`` 仅在 ``ok=False`` 时非空。"""
+
+    ok: bool
+    label: str
+    url: str
+    model: str
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+class TestServicesResponse(BaseModel):
+    """连通性测试结果。``ok`` 为本次选中的所有服务是否全部通过。"""
+
+    ok: bool
+    timeout: float
+    services: Dict[str, ServiceProbeResult]

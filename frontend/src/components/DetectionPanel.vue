@@ -45,6 +45,9 @@ const passedRules = computed(() => {
         <el-descriptions-item label="风险等级">{{ input.risk_level }}</el-descriptions-item>
         <el-descriptions-item label="风险类别">{{ input.category }}</el-descriptions-item>
         <el-descriptions-item label="决策方式">{{ input.decision_by }}</el-descriptions-item>
+        <el-descriptions-item v-if="input.sensitivity" label="检测敏感度">
+          {{ input.sensitivity }}
+        </el-descriptions-item>
         <el-descriptions-item label="置信度">{{ percent(input.confidence) }}</el-descriptions-item>
         <el-descriptions-item label="P(安全)">
           <el-progress

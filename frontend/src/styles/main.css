@@ -339,6 +339,34 @@ body {
   color: var(--el-text-color-secondary);
 }
 
+/* 服务连通性：四行探测结果 */
+.settings .probe-list {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.settings .probe-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 28px;
+  font-size: 13px;
+}
+
+.settings .probe-row__label {
+  min-width: 110px;
+  font-weight: 500;
+}
+
+.settings .probe-row__meta {
+  color: var(--el-text-color-secondary);
+}
+
+.settings .probe-row__error {
+  color: var(--el-color-danger);
+  word-break: break-all;
+}
+
 .mr {
   margin-right: 6px;
 }

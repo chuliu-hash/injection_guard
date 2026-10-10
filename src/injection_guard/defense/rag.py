@@ -1,6 +1,6 @@
 """RAG 安全上下文：检索相似的安全示例，拼装防御性 prompt。
 
-首次运行时从 ``overthink_prompt.json`` 构建向量库并缓存为 ``*.pt``，
+首次运行时从 json 构建向量库并缓存为 .pt，
 之后直接加载缓存，并支持增量追加新攻击样本。
 """
 
@@ -87,7 +87,7 @@ class SCR_RAG_System:
             logger.error("调用 Embedding API 失败: %s", exc)
             raise
 
-    def build_vector_db_from_json(self, batch_size: int = 16, max_prompt_chars: int = 9999) -> None:
+    def build_vector_db_from_json(self, batch_size: int = 16, max_prompt_chars: int = 8192) -> None:
         if not os.path.exists(self.db_path):
             logger.error("未找到原始数据文件 %s，无法构建知识库。", self.db_path)
             return

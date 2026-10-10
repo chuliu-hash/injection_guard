@@ -46,6 +46,7 @@ class _StubService(DefenseService):
         self._rag_exc = rag_exc
         self._chat_chunks = list(chat_chunks)
         self.chat_prompts = []
+        self.chat_params = []
         self.output_calls = []
 
     def _run_input_detection_guarded(self, **_kw):
@@ -60,8 +61,9 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_stream_guarded(self, prompt):
+    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None):
         self.chat_prompts.append(prompt)
+        self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
         yield from self._chat_chunks
 
 
@@ -80,6 +82,23 @@ def test_input_unsafe_emits_input_then_done():
     assert events[-1][1]["is_safe"] is False
     assert events[-1][1]["stopped_at"] == "input_detection"
     assert svc.chat_prompts == []
+
+
+def test_chat_generation_params_passed_through():
+    """流式路径同样把请求体的 temperature / max_tokens 透传给聊天客户端。"""
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    _collect(svc, user_input="你好", temperature=1.2, max_tokens=256)
+    assert svc.chat_params == [{"max_tokens": 256, "temperature": 1.2}]
+
+
+def test_request_skip_flag_enables_output_skip():
+    """流式路径：请求体 skip_output_when_high_confidence=True 覆盖 Settings 的 false。"""
+    svc = _StubService(
+        _settings(skip_output_when_high_confidence=False), input_result=SAFE_INPUT
+    )
+    events = _collect(svc, user_input="你好", skip_output_when_high_confidence=True)
+    assert events[-1][1]["stopped_at"] == "output_skipped"
+    assert svc.output_calls == []
 
 
 def test_event_sequence_happy_path():

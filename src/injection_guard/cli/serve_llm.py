@@ -9,7 +9,7 @@ import re
 import subprocess
 import threading
 
-from ..config import get_settings
+from ..config import get_settings, inference_env_name
 from ..logging_config import setup_logging
 from ..services.llm_server import start_api_server
 
@@ -52,7 +52,7 @@ def main() -> None:
     parser.add_argument("--lora_path", type=str, default=None, help="LoRA 适配器路径（默认取 model_path）")
 
     # ── 网络参数 ──
-    parser.add_argument("--host", type=str, default="127.1.1.1")
+    parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8094)
     parser.add_argument("--public", action="store_true")
 
@@ -66,14 +66,23 @@ def main() -> None:
     parser.add_argument(
         "--request-timeout", type=int, default=300, help="单个推理请求的最大等待+执行时间（秒），默认 300"
     )
+    parser.add_argument(
+        "--service",
+        type=str,
+        choices=["input", "output", "chat"],
+        default=None,
+        help="服务名：决定从 configs/services.env 读取哪一块推理参数（INPUT_/OUTPUT_/CHAT_ 前缀）",
+    )
 
     args = parser.parse_args()
 
     setup_logging(get_settings().log_level)
 
-    # GPU 列表需在首次 get_settings() 之前写入环境变量
+    # GPU 列表需在首次 get_inference_settings() 之前写入环境变量（@lru_cache 冻结首次读取）；
+    # 变量名按 --service 加前缀（如 INPUT_API_SERVER_GPU_IDS），与 configs/services.env 一致。
+    # 勿在此之前读取推理配置（例如为日志提前调用 get_inference_settings）。
     if args.gpu_ids:
-        os.environ["API_SERVER_GPU_IDS"] = args.gpu_ids
+        os.environ[inference_env_name(args.service, "API_SERVER_GPU_IDS")] = args.gpu_ids
 
     # 启动隧道（如果需要）
     tunnel_proc = None
@@ -93,6 +102,7 @@ def main() -> None:
             model_path=args.model_path,
             base_model_path=args.base_model_path,
             lora_path=args.lora_path,
+            service=args.service,
         )
     finally:
         if tunnel_proc:

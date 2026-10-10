@@ -16,11 +16,13 @@ from injection_guard.api.dependencies import (
     DetectionError,
     ServiceBusyError,
     get_defense_service,
+    validate_defend_request,
 )
+from injection_guard.services import connectivity
 
 
 class _FakeSettings:
-    fixed_sensitivity = "low"
+    default_sensitivity = "low"
     skip_output_when_high_confidence = True
     safe_skip_threshold = 0.5
     enable_rag = False
@@ -44,6 +46,7 @@ class _FakeService:
         return []
 
     def detect(self, **_kwargs: Any) -> DefendOutcome:
+        self.detect_kwargs = _kwargs
         if self._exc is not None:
             raise self._exc
         assert self._outcome is not None
@@ -75,7 +78,7 @@ def test_health():
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["fixed_sensitivity"] == "low"
+    assert body["default_sensitivity"] == "low"
     assert body["chat_max_concurrency"] == 8
 
 
@@ -98,6 +101,72 @@ def test_empty_model_response_returns_400():
     resp = client.post("/api/prompt_defend", json={"user_input": "hi", "model_response": "  "})
     assert resp.status_code == 400
     assert resp.json() == {"error": "model_response 不能为空"}
+
+
+def test_generation_params_reach_service():
+    """路由把请求体的 temperature / max_tokens 透传给防御服务。"""
+    svc = _FakeService(outcome=DefendOutcome(True, None, SAFE_INPUT, None))
+    client = _client(svc)
+    resp = client.post(
+        "/api/prompt_defend",
+        json={"user_input": "你好", "temperature": 0.3, "max_tokens": 64},
+    )
+    assert resp.status_code == 200
+    assert svc.detect_kwargs["temperature"] == 0.3
+    assert svc.detect_kwargs["max_tokens"] == 64
+
+
+def test_sensitivity_reaches_service():
+    """请求体 sensitivity 透传给防御服务；缺省为 None（后端按默认值处理）。"""
+    svc = _FakeService(outcome=DefendOutcome(True, None, SAFE_INPUT, None))
+    client = _client(svc)
+    resp = client.post("/api/prompt_defend", json={"user_input": "你好", "sensitivity": "high"})
+    assert resp.status_code == 200
+    assert svc.detect_kwargs["sensitivity"] == "high"
+
+    client.post("/api/prompt_defend", json={"user_input": "你好"})
+    assert svc.detect_kwargs["sensitivity"] is None
+
+
+def test_invalid_sensitivity_returns_400():
+    client = _client(_FakeService())
+    resp = client.post("/api/prompt_defend", json={"user_input": "hi", "sensitivity": "extreme"})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "sensitivity 必须是 low / medium / high 之一"}
+
+
+def test_safe_skip_threshold_out_of_range_returns_400():
+    client = _client(_FakeService())
+    resp = client.post(
+        "/api/prompt_defend", json={"user_input": "hi", "safe_skip_threshold": 1.5}
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "safe_skip_threshold 必须在 0~1 之间"}
+
+
+def test_validate_rejects_non_bool_skip_flag():
+    # 直接测校验函数（经 FastAPI/Pydantic 时非法布尔值会先被 422 拦下）
+    ok, message = validate_defend_request(
+        {"user_input": "hi", "skip_output_when_high_confidence": "yes"}
+    )
+    assert ok is False
+    assert message == "skip_output_when_high_confidence 必须是布尔值"
+
+
+def test_temperature_out_of_range_returns_400():
+    client = _client(_FakeService())
+    resp = client.post(
+        "/api/prompt_defend", json={"user_input": "hi", "temperature": 2.5}
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "temperature 必须在 0~2 之间"}
+
+
+def test_max_tokens_non_positive_returns_400():
+    client = _client(_FakeService())
+    resp = client.post("/api/prompt_defend", json={"user_input": "hi", "max_tokens": 0})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "max_tokens 必须 >= 1"}
 
 
 def test_input_blocked_stops_at_input_detection():
@@ -172,3 +241,89 @@ def test_non_json_body_returns_400():
     )
     assert resp.status_code == 400
     assert "error" in resp.json()
+
+
+# ── POST /api/test_services（连通性测试）────────────────────────────────
+
+
+def _stub_check_services(monkeypatch, recorder: Dict[str, Any]):
+    """把 connectivity.check_services 换成桩：记录入参并返回固定报告。"""
+
+    def fake(settings, services=None, timeout=None):
+        recorder["settings"] = settings
+        recorder["services"] = services
+        recorder["timeout"] = timeout
+        keys = list(services) if services else list(connectivity.SERVICE_KEYS)
+        return {
+            "ok": True,
+            "timeout": connectivity.normalize_timeout(timeout),
+            "services": {
+                key: {
+                    "ok": True,
+                    "label": key,
+                    "url": "http://x/v1",
+                    "model": "m",
+                    "latency_ms": 1.0,
+                    "error": None,
+                }
+                for key in keys
+            },
+        }
+
+    monkeypatch.setattr(connectivity, "check_services", fake)
+
+
+def test_test_services_defaults_to_all(monkeypatch):
+    recorder: Dict[str, Any] = {}
+    _stub_check_services(monkeypatch, recorder)
+    service = _FakeService()
+
+    resp = _client(service).post("/api/test_services")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["timeout"] == connectivity.DEFAULT_TIMEOUT
+    assert set(body["services"]) == set(connectivity.SERVICE_KEYS)
+    assert body["services"]["chat"]["ok"] is True
+    # 桩收到的是 DefenseService 的 settings（而非重新 get_settings）
+    assert recorder["settings"] is service.settings
+    assert recorder["services"] is None
+
+
+def test_test_services_subset_and_timeout(monkeypatch):
+    recorder: Dict[str, Any] = {}
+    _stub_check_services(monkeypatch, recorder)
+
+    resp = _client(_FakeService()).post(
+        "/api/test_services", json={"services": ["chat"], "timeout": 2.5}
+    )
+
+    assert resp.status_code == 200
+    assert set(resp.json()["services"]) == {"chat"}
+    assert recorder["services"] == ["chat"]
+    assert recorder["timeout"] == 2.5
+
+
+def test_test_services_unknown_name_returns_400():
+    resp = _client(_FakeService()).post("/api/test_services", json={"services": ["nope"]})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert "error" in body
+    assert "nope" in body["error"]
+
+
+def test_test_services_empty_list_returns_400():
+    resp = _client(_FakeService()).post("/api/test_services", json={"services": []})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "services 不能为空列表"}
+
+
+def test_test_services_timeout_out_of_range_returns_400():
+    client = _client(_FakeService())
+    resp = client.post("/api/test_services", json={"timeout": 99})
+    assert resp.status_code == 400
+    assert "timeout" in resp.json()["error"]
+
+    resp = client.post("/api/test_services", json={"timeout": 0.1})
+    assert resp.status_code == 400

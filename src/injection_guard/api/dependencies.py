@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
-from ..config import Settings, get_settings
+from ..config import SENSITIVITY_LEVELS, Settings, get_settings
 from ..services.gpu import parse_gpu_ids
 
 if TYPE_CHECKING:  # 仅类型检查时导入，避免把 torch/transformers 带到模块加载
@@ -66,6 +66,41 @@ def validate_defend_request(data: Optional[Dict[str, Any]]) -> Tuple[bool, Optio
             return False, "model_response 必须是字符串"
         if not model_response.strip():
             return False, "model_response 不能为空"
+
+    # 聊天生成参数（可选，前端设置面板提供）
+    temperature = data.get("temperature")
+    if temperature is not None:
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+            return False, "temperature 必须是数字"
+        if not 0.0 <= float(temperature) <= 2.0:
+            return False, "temperature 必须在 0~2 之间"
+
+    max_tokens = data.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            return False, "max_tokens 必须是整数"
+        if max_tokens < 1:
+            return False, "max_tokens 必须 >= 1"
+
+    # 输出检测跳过策略（前端设置面板提供）
+    safe_skip_threshold = data.get("safe_skip_threshold")
+    if safe_skip_threshold is not None:
+        if isinstance(safe_skip_threshold, bool) or not isinstance(
+            safe_skip_threshold, (int, float)
+        ):
+            return False, "safe_skip_threshold 必须是数字"
+        if not 0.0 <= float(safe_skip_threshold) <= 1.0:
+            return False, "safe_skip_threshold 必须在 0~1 之间"
+
+    skip_flag = data.get("skip_output_when_high_confidence")
+    if skip_flag is not None and not isinstance(skip_flag, bool):
+        return False, "skip_output_when_high_confidence 必须是布尔值"
+
+    # 输入检测敏感度（前端设置面板提供）
+    sensitivity = data.get("sensitivity")
+    if sensitivity is not None:
+        if not isinstance(sensitivity, str) or sensitivity.strip().lower() not in SENSITIVITY_LEVELS:
+            return False, "sensitivity 必须是 low / medium / high 之一"
 
     return True, None
 
@@ -135,7 +170,7 @@ class DefenseService:
 
         detector = Detector(**kwargs)
         detector.set_bert()
-        detector.set_sensitivity(self.settings.fixed_sensitivity)
+        detector.set_sensitivity(self.settings.default_sensitivity)
         return detector
 
     def _get_input_detector(
@@ -175,7 +210,7 @@ class DefenseService:
             self._input_cycle = itertools.cycle(self._input_detectors)
             logger.info(
                 "[预热] 输入检测器池就绪: sensitivity=%s, devices=%s",
-                self.settings.fixed_sensitivity,
+                self.settings.default_sensitivity,
                 [str(d.device) for d in self._input_detectors],
             )
             return next(self._input_cycle)
@@ -245,12 +280,15 @@ class DefenseService:
         use_bert: bool = False,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
+        sensitivity: Optional[str] = None,
     ) -> Dict[str, Any]:
         detector = self._get_input_detector(
             use_bert=use_bert, llm_api_url=llm_api_url, llm_api_model=llm_api_model
         )
 
-        results = detector.detect_with_bert_group(text)
+        # 敏感度以**局部参数**传入：同一 Detector 实例被并发请求轮询复用时，
+        # 阈值只在本次调用内生效，不会串扰其他请求（见 prompt_detection.normalize_sensitivity）。
+        results = detector.detect_with_bert_group(text, sensitivity=sensitivity)
         if not results:
             raise RuntimeError("输入检测器返回空结果")
 
@@ -268,6 +306,11 @@ class DefenseService:
 
         probs_dict = final_result.get("probabilities", {})
 
+        # 回显本次实际生效的档位（未指定时即该 Detector 的默认值）。
+        from ..defense.prompt_detection import normalize_sensitivity
+
+        effective_sensitivity = normalize_sensitivity(sensitivity, detector.sensitivity)
+
         return {
             "is_safe": is_safe,
             "risk_level": final_result.get("mapped_risk_level", "无风险" if is_safe else "未知风险"),
@@ -279,6 +322,7 @@ class DefenseService:
             ),
             "decision_by": final_result.get("final_decision_by", "unknown"),
             "detection_error": detection_error,
+            "sensitivity": effective_sensitivity,
         }
 
     def _run_input_detection_guarded(
@@ -287,6 +331,7 @@ class DefenseService:
         use_bert: bool = False,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
+        sensitivity: Optional[str] = None,
     ) -> Dict[str, Any]:
         """带并发控制的输入检测；获取名额超时抛 ``ServiceBusyError``。"""
         acquired = self._input_sem.acquire(timeout=self.settings.input_acquire_timeout)
@@ -294,7 +339,11 @@ class DefenseService:
             raise ServiceBusyError("输入检测服务繁忙，请稍后重试")
         try:
             return self._run_input_detection(
-                text=text, use_bert=use_bert, llm_api_url=llm_api_url, llm_api_model=llm_api_model
+                text=text,
+                use_bert=use_bert,
+                llm_api_url=llm_api_url,
+                llm_api_model=llm_api_model,
+                sensitivity=sensitivity,
             )
         finally:
             self._input_sem.release()
@@ -363,25 +412,49 @@ class DefenseService:
             ],
         }
 
-    def _run_chat(self, prompt: str) -> str:
-        """调用普通聊天接口生成回复。"""
-        return self._get_chat_client().complete(prompt)
+    def _run_chat(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """调用普通聊天接口生成回复（生成参数来自请求，留空用 Settings 默认值）。"""
+        return self._get_chat_client().complete(
+            prompt, max_tokens=max_tokens, temperature=temperature
+        )
 
-    def _run_chat_guarded(self, prompt: str) -> str:
+    def _run_chat_guarded(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
         """带并发控制的聊天生成；获取名额超时抛 ``ServiceBusyError``。"""
         acquired = self._chat_sem.acquire(timeout=self.settings.chat_acquire_timeout)
         if not acquired:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
-            return self._run_chat(prompt)
+            return self._run_chat(prompt, max_tokens=max_tokens, temperature=temperature)
         finally:
             self._chat_sem.release()
 
-    def _run_chat_stream(self, prompt: str) -> Iterator[str]:
+    def _run_chat_stream(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Iterator[str]:
         """流式调用普通聊天接口，逐段 yield 文本增量。"""
-        yield from self._get_chat_client().stream(prompt)
+        yield from self._get_chat_client().stream(
+            prompt, max_tokens=max_tokens, temperature=temperature
+        )
 
-    def _run_chat_stream_guarded(self, prompt: str) -> Iterator[str]:
+    def _run_chat_stream_guarded(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Iterator[str]:
         """带并发控制的流式聊天生成；获取名额超时抛 ``ServiceBusyError``。
 
         生成器被提前关闭（客户端断开）时，``finally`` 仍会释放并发名额。
@@ -390,11 +463,31 @@ class DefenseService:
         if not acquired:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
-            yield from self._run_chat_stream(prompt)
+            yield from self._run_chat_stream(
+                prompt, max_tokens=max_tokens, temperature=temperature
+            )
         finally:
             self._chat_sem.release()
 
     # ── 流水线 ───────────────────────────────────────────────────────
+
+    def _resolve_skip_policy(
+        self,
+        skip_output_when_high_confidence: Optional[bool],
+        safe_skip_threshold: Optional[float],
+    ) -> Tuple[bool, float]:
+        """输出检测跳过策略：请求值优先，缺省回落 ``Settings``（启动默认值）。"""
+        enabled = (
+            self.settings.skip_output_when_high_confidence
+            if skip_output_when_high_confidence is None
+            else skip_output_when_high_confidence
+        )
+        threshold = (
+            self.settings.safe_skip_threshold
+            if safe_skip_threshold is None
+            else safe_skip_threshold
+        )
+        return enabled, threshold
 
     def detect(
         self,
@@ -402,6 +495,7 @@ class DefenseService:
         user_input: str,
         model_response: Optional[str] = None,
         use_rag: Optional[bool] = None,
+        sensitivity: Optional[str] = None,
         use_bert: bool = False,
         input_llm_api_url: Optional[str] = None,
         input_llm_api_model: Optional[str] = None,
@@ -409,6 +503,10 @@ class DefenseService:
         detector_api_key: Optional[str] = None,
         detector_api_url: Optional[str] = None,
         detector_model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        safe_skip_threshold: Optional[float] = None,
+        skip_output_when_high_confidence: Optional[bool] = None,
     ) -> DefendOutcome:
         """执行端到端流水线。
 
@@ -419,13 +517,14 @@ class DefenseService:
         - 输入安全且高置信：``stopped_at="output_skipped"``，跳过输出检测（仍返回 model_response）；
         - 否则走完输出检测：``stopped_at=None``。
         """
-        # 1) 输入检测
+        # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
         try:
             input_detection = self._run_input_detection_guarded(
                 text=user_input,
                 use_bert=use_bert,
                 llm_api_url=input_llm_api_url,
                 llm_api_model=input_llm_api_model,
+                sensitivity=sensitivity,
             )
         except ServiceBusyError:
             logger.warning(
@@ -461,7 +560,9 @@ class DefenseService:
         # 3) 生成 model_response（请求已提供则跳过聊天调用）
         if model_response is None:
             try:
-                model_response = self._run_chat_guarded(final_prompt)
+                model_response = self._run_chat_guarded(
+                    final_prompt, max_tokens=max_tokens, temperature=temperature
+                )
             except ServiceBusyError:
                 logger.warning(
                     "[503] chat busy (timeout=%ss)", self.settings.chat_acquire_timeout
@@ -471,10 +572,10 @@ class DefenseService:
                 raise DetectionError(f"聊天生成失败: {exc}") from exc
 
         # 4) 输入安全且高置信：跳过输出检测（仍返回 model_response）
-        if (
-            self.settings.skip_output_when_high_confidence
-            and input_detection.get("p_safe", 0.0) >= self.settings.safe_skip_threshold
-        ):
+        skip_hc, skip_threshold = self._resolve_skip_policy(
+            skip_output_when_high_confidence, safe_skip_threshold
+        )
+        if skip_hc and input_detection.get("p_safe", 0.0) >= skip_threshold:
             return DefendOutcome(
                 True, "output_skipped", input_detection, None, model_response, rag_info
             )
@@ -512,6 +613,7 @@ class DefenseService:
         user_input: str,
         model_response: Optional[str] = None,
         use_rag: Optional[bool] = None,
+        sensitivity: Optional[str] = None,
         use_bert: bool = False,
         input_llm_api_url: Optional[str] = None,
         input_llm_api_model: Optional[str] = None,
@@ -519,6 +621,10 @@ class DefenseService:
         detector_api_key: Optional[str] = None,
         detector_api_url: Optional[str] = None,
         detector_model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        safe_skip_threshold: Optional[float] = None,
+        skip_output_when_high_confidence: Optional[bool] = None,
     ) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """``detect`` 的流式版本，逐事件 yield ``(event, data)``。
 
@@ -527,13 +633,14 @@ class DefenseService:
         高置信跳过等语义与 ``detect`` 完全一致；异常类型也一致
         （``ServiceBusyError`` / ``DetectionError``），由上层转成 SSE ``error`` 事件。
         """
-        # 1) 输入检测
+        # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
         try:
             input_detection = self._run_input_detection_guarded(
                 text=user_input,
                 use_bert=use_bert,
                 llm_api_url=input_llm_api_url,
                 llm_api_model=input_llm_api_model,
+                sensitivity=sensitivity,
             )
         except ServiceBusyError:
             logger.warning(
@@ -579,7 +686,9 @@ class DefenseService:
         if model_response is None:
             try:
                 chunks: List[str] = []
-                for delta in self._run_chat_stream_guarded(final_prompt):
+                for delta in self._run_chat_stream_guarded(
+                    final_prompt, max_tokens=max_tokens, temperature=temperature
+                ):
                     chunks.append(delta)
                     yield "delta", {"content": delta}
                 model_response = "".join(chunks)
@@ -590,10 +699,10 @@ class DefenseService:
                 raise DetectionError(f"聊天生成失败: {exc}") from exc
 
         # 4) 输入安全且高置信：跳过输出检测（仍返回 model_response）
-        if (
-            self.settings.skip_output_when_high_confidence
-            and input_detection.get("p_safe", 0.0) >= self.settings.safe_skip_threshold
-        ):
+        skip_hc, skip_threshold = self._resolve_skip_policy(
+            skip_output_when_high_confidence, safe_skip_threshold
+        )
+        if skip_hc and input_detection.get("p_safe", 0.0) >= skip_threshold:
             yield "done", {
                 "is_safe": True,
                 "stopped_at": "output_skipped",

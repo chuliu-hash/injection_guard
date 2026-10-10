@@ -13,18 +13,48 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from ..config import get_settings
+from ..config import SENSITIVITY_LEVELS, get_settings
 from ..url_utils import join_endpoint
 from .confidence_vote import confidence_weighted_vote
 from .risk_mapping import CATEGORY_NAMES, RISK_LEVEL_MAPPING
 
 logger = logging.getLogger(__name__)
+
+# 敏感度档位与阈值表：可经请求体 ``sensitivity`` **逐次**指定（缺省取 ``Settings.default_sensitivity``）。
+# 阈值只在单次调用内以局部变量参与判定，故同一个 Detector 实例可被并发请求复用，
+# 不会出现「一个请求改了阈值、另一个请求跟着变」的串扰。
+# 键必须与 ``config.SENSITIVITY_LEVELS``（API 层校验用）一致。
+SENSITIVITY_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "low": {"dec_thresh": 0.97, "llm_conf": 0.7, "llm_p": (0.45, 0.55), "llm_accept": 0.99},
+    "medium": {"dec_thresh": 0.5, "llm_conf": 0.7, "llm_p": (0.3, 0.7), "llm_accept": 0.80},
+    "high": {"dec_thresh": 0.3, "llm_conf": 0.8, "llm_p": (0.2, 0.8), "llm_accept": 0.50},
+}
+
+if tuple(SENSITIVITY_CONFIGS) != SENSITIVITY_LEVELS:  # pragma: no cover - 导入期一致性自检
+    raise RuntimeError(
+        f"SENSITIVITY_CONFIGS 档位 {tuple(SENSITIVITY_CONFIGS)} 与 "
+        f"config.SENSITIVITY_LEVELS {SENSITIVITY_LEVELS} 不一致"
+    )
+
+
+def normalize_sensitivity(level: Optional[str], fallback: str = "low") -> str:
+    """把敏感度归一到 ``low`` / ``medium`` / ``high``。
+
+    未知值（非空）打告警日志并回退到 ``fallback``（应已是归一值）。
+    """
+    normalized = (level or "").strip().lower()
+    if normalized not in SENSITIVITY_CONFIGS:
+        if normalized:
+            logger.warning("[Detector] 未知检测强度 %r，回退到 %r", level, fallback)
+        return fallback
+    return normalized
 
 
 @dataclass
@@ -86,46 +116,47 @@ class Detector:
         self._http_session.mount("http://", adapter)
         self._http_session.mount("https://", adapter)
 
+        # 敏感度基线（启动默认值）；单次调用可经 detect_* 的 sensitivity 参数覆盖
+        self.set_sensitivity(settings.default_sensitivity)
+
     def set_bert(self, model_paths: Optional[List[str]] = None) -> None:
         if not self.use_bert:
             return
 
-        root = str(get_settings().bert_model_dir)
         if model_paths is None:
-            self.model_paths = [
-                f"{root}/fine_tuned_model",
-                f"{root}/protectai_deberta-v3-base-prompt-injection-v2",
-                f"{root}/fine_tuned_model_base",
-                f"{root}/mdeberta-prompt-injection-detector",
-            ]
-        else:
-            self.model_paths = model_paths
+            # 不硬编码子目录名：扫描 BERT 根目录下**所有**模型目录（含 config.json 的子目录），
+            # 排序保证顺序稳定。增删模型只需在根目录下增删文件夹，无需改代码。
+            root = Path(get_settings().bert_model_dir)
+            model_paths = (
+                sorted(
+                    str(child)
+                    for child in root.iterdir()
+                    if child.is_dir() and (child / "config.json").is_file()
+                )
+                if root.is_dir()
+                else []
+            )
+            if not model_paths:
+                logger.warning("[Detector] 未在 %s 下发现任何 BERT 模型目录", root)
 
+        self.model_paths = model_paths
         self._load_bert_models()
 
     def set_sensitivity(self, level: str) -> None:
-        level = level.lower()
-        if level not in ("low", "medium", "high"):
-            logger.warning("[Detector] 未知强度 %r，回退到 'low'", level)
-            level = "low"
+        """设定本 Detector 的**默认**敏感度档位（单次调用可经 ``detect_*`` 的
+        ``sensitivity`` 参数覆盖，见 ``normalize_sensitivity``）。"""
+        level = normalize_sensitivity(level, self.__dict__.get("sensitivity", "low"))
 
         self.sensitivity = level
 
-        # 阈值配置
-        configs = {
-            "low": {"dec_thresh": 0.97, "llm_conf": 0.7, "llm_p": (0.45, 0.55), "llm_accept": 0.99},
-            "medium": {"dec_thresh": 0.5, "llm_conf": 0.7, "llm_p": (0.3, 0.7), "llm_accept": 0.80},
-            "high": {"dec_thresh": 0.3, "llm_conf": 0.8, "llm_p": (0.2, 0.8), "llm_accept": 0.50},
-        }
-
-        cfg = configs[level]
+        cfg = SENSITIVITY_CONFIGS[level]
         self.decision_threshold = cfg["dec_thresh"]
         self.llm_conf_threshold = cfg["llm_conf"]
         self.llm_p_range = cfg["llm_p"]
         self.llm_accept_threshold = cfg["llm_accept"]
 
         logger.info(
-            "[Detector] 检测强度: %s (BERT阈值=%s, LLM采纳阈值=%s), use_bert:%s",
+            "[Detector] 默认检测强度: %s (BERT阈值=%s, LLM采纳阈值=%s), use_bert:%s",
             level,
             self.decision_threshold,
             self.llm_accept_threshold,
@@ -161,7 +192,24 @@ class Detector:
         if loaded_count == 0:
             logger.warning("未能成功加载任何 BERT 模型。")
 
-    def detect_with_bert_group(self, text: str) -> List[Dict]:
+    def detect_with_bert_group(self, text: str, sensitivity: Optional[str] = None) -> List[Dict]:
+        """BERT 组检测 + 可选 LLM 复审。
+
+        ``sensitivity`` 为**本次调用**的敏感度档位（``low`` / ``medium`` / ``high``）；
+        缺省用本实例的默认档位（``set_sensitivity`` 设定）。阈值仅以局部变量参与
+        判定，故并发请求复用同一实例时互不干扰。
+        """
+        level = (
+            self.sensitivity
+            if sensitivity is None
+            else normalize_sensitivity(sensitivity, self.sensitivity)
+        )
+        cfg = SENSITIVITY_CONFIGS[level]
+        dec_thresh: float = cfg["dec_thresh"]
+        llm_conf_threshold: float = cfg["llm_conf"]
+        llm_p_range: Tuple[float, float] = cfg["llm_p"]
+        llm_accept_threshold: float = cfg["llm_accept"]
+
         results: List[Dict] = []
 
         # 1. BERT 组并行检测
@@ -211,7 +259,7 @@ class Detector:
         else:
             p_final, confidence_score, diag = 0.0, 1.0, {}
 
-        pred_final = 1 if p_final > self.decision_threshold else 0
+        pred_final = 1 if p_final > dec_thresh else 0
 
         ensemble_p_safe = float(1.0 - p_final)
         ensemble_p_attack = float(p_final)
@@ -233,19 +281,19 @@ class Detector:
         if not self.enable_llm_fallback:
             ensemble_result["decision"] = "不安全" if pred_final == 1 else "安全"
         else:
-            low_p, high_p = self.llm_p_range
+            low_p, high_p = llm_p_range
             needs_llm_review = (
-                confidence_score < self.llm_conf_threshold or low_p < p_final < high_p
+                confidence_score < llm_conf_threshold or low_p < p_final < high_p
             ) or not self.use_bert
             ensemble_result["decision"] = (
                 "LLM_review"
                 if needs_llm_review
-                else ("不安全" if p_final > self.decision_threshold else "安全")
+                else ("不安全" if p_final > dec_thresh else "安全")
             )
 
         # 4. 执行 LLM 复审
         if ensemble_result["decision"] == "LLM_review" and self.enable_llm_fallback:
-            llm_result = self._invoke_llm_fallback(text)
+            llm_result = self._invoke_llm_fallback(text, llm_accept_threshold=llm_accept_threshold)
 
             llm_pred = llm_result.get("prediction", 0)
             llm_conf = float(llm_result.get("confidence_score", 0.0))
@@ -282,14 +330,24 @@ class Detector:
         results.append(ensemble_result)
         return results
 
-    def _invoke_llm_fallback(self, text: str) -> Dict:
-        """调用 LLM 进行复审。"""
+    def _invoke_llm_fallback(
+        self, text: str, llm_accept_threshold: Optional[float] = None
+    ) -> Dict:
+        """调用 LLM 进行复审。
+
+        ``llm_accept_threshold`` 为本次调用的采纳阈值（缺省用实例默认档位的值）。
+        """
+        accept_threshold = (
+            self.llm_accept_threshold
+            if llm_accept_threshold is None
+            else llm_accept_threshold
+        )
         start_time = time.time()
         try:
             payload = {
                 "model": self.llm_api_model,
                 "messages": [{"role": "user", "content": text}],
-                "max_tokens": 64,
+                # 生成长度由推理服务（INPUT_API_SERVER_MAX_NEW_TOKENS）决定，客户端不指定。
                 "temperature": 0.0,
                 "top_p": 0.9,
                 "stream": False,
@@ -322,9 +380,7 @@ class Detector:
             except (IndexError, AttributeError, TypeError):
                 pass
 
-            final_is_unsafe = text_is_unsafe and (
-                confidence_score >= self.llm_accept_threshold
-            )
+            final_is_unsafe = text_is_unsafe and (confidence_score >= accept_threshold)
 
             code = None
             risk_level_str = "无风险"
@@ -382,10 +438,20 @@ class Detector:
             pass
         return 1
 
-    def batch_detect(self, texts: List[str]) -> List[Dict]:
-        """批量检测多个文本（真正的批量推理）。"""
+    def batch_detect(self, texts: List[str], sensitivity: Optional[str] = None) -> List[Dict]:
+        """批量检测多个文本（真正的批量推理）。
+
+        ``sensitivity`` 语义与 ``detect_with_bert_group`` 相同（缺省用实例默认档位）。
+        """
         if not texts:
             return []
+
+        level = (
+            self.sensitivity
+            if sensitivity is None
+            else normalize_sensitivity(sensitivity, self.sensitivity)
+        )
+        dec_thresh: float = SENSITIVITY_CONFIGS[level]["dec_thresh"]
 
         results = []
 
@@ -447,7 +513,7 @@ class Detector:
             else:
                 p_final, confidence_score = 0.0, 1.0
 
-            pred_final = 1 if p_final > self.decision_threshold else 0
+            pred_final = 1 if p_final > dec_thresh else 0
             ensemble_p_safe = float(1.0 - p_final)
             ensemble_p_attack = float(p_final)
 

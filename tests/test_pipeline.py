@@ -46,6 +46,7 @@ class _StubService(DefenseService):
         self._rag_exc = rag_exc
         self._chat_reply = chat_reply
         self.chat_prompts = []
+        self.chat_params = []
         self.output_calls = []
 
     def _run_input_detection_guarded(self, **_kw):
@@ -60,8 +61,9 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_guarded(self, prompt):
+    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None):
         self.chat_prompts.append(prompt)
+        self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
         return self._chat_reply
 
 
@@ -80,6 +82,41 @@ def test_generates_response_when_not_provided():
     assert svc.chat_prompts == ["你好"]
     assert outcome.model_response == "REPLY"
     assert outcome.stopped_at is None
+
+
+def test_chat_generation_params_passed_through():
+    """请求体的 temperature / max_tokens 透传给聊天客户端。"""
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    svc.detect(user_input="你好", temperature=0.3, max_tokens=64)
+    assert svc.chat_params == [{"max_tokens": 64, "temperature": 0.3}]
+
+
+def test_chat_generation_params_default_none():
+    """未提供时传 None，由 ChatClient 回落到 Settings 默认值。"""
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    svc.detect(user_input="你好")
+    assert svc.chat_params == [{"max_tokens": None, "temperature": None}]
+
+
+def test_request_skip_flag_enables_output_skip():
+    """请求体 skip_output_when_high_confidence=True 覆盖 Settings 的 false。"""
+    svc = _StubService(
+        _settings(skip_output_when_high_confidence=False), input_result=SAFE_INPUT
+    )
+    outcome = svc.detect(user_input="你好", skip_output_when_high_confidence=True)
+    assert outcome.stopped_at == "output_skipped"
+    assert svc.output_calls == []
+
+
+def test_request_threshold_controls_output_skip():
+    """请求体 safe_skip_threshold 覆盖 Settings：0.99 < 0.999 → 不跳过。"""
+    svc = _StubService(
+        _settings(skip_output_when_high_confidence=True, safe_skip_threshold=0.5),
+        input_result=SAFE_INPUT,
+    )
+    outcome = svc.detect(user_input="你好", safe_skip_threshold=0.999)
+    assert outcome.stopped_at is None
+    assert len(svc.output_calls) == 1
 
 
 def test_provided_response_skips_chat():

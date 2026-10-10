@@ -18,7 +18,7 @@ from .dependencies import (
     get_defense_service,
     validate_defend_request,
 )
-from .schemas import DefendRequest, DefendResponse
+from .schemas import DefendRequest, DefendResponse, TestServicesRequest, TestServicesResponse
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def health(service: DefenseService = Depends(get_defense_service)) -> dict:
     settings = service.settings
     return {
         "status": "ok",
-        "fixed_sensitivity": settings.fixed_sensitivity,
+        "default_sensitivity": settings.default_sensitivity,
         "input_max_concurrency": service.input_max_concurrency,
         "output_max_concurrency": service.output_max_concurrency,
         "chat_max_concurrency": service.chat_max_concurrency,
@@ -56,6 +56,57 @@ def health(service: DefenseService = Depends(get_defense_service)) -> dict:
 
 
 @router.post(
+    "/api/test_services",
+    response_model=TestServicesResponse,
+    summary="连通性测试：输入/输出/RAG/聊天 四个下游模型服务",
+)
+def test_services(
+    payload: Optional[TestServicesRequest] = None,
+    service: DefenseService = Depends(get_defense_service),
+):
+    """对四个下游服务各发一次最小请求，验证「能连上 + 模型可用」。
+
+    请求体可省略（默认全测）；可只测其中几个：
+
+    ```json
+    {"services": ["input", "chat"], "timeout": 5}
+    ```
+
+    服务键 ``input`` / ``output`` / ``rag`` / ``chat``；``timeout`` 为单次探测超时（秒，
+    0.5~60，默认 5）。**总是返回 200**，逐个服务成败在 ``services`` 里；仅当参数非法
+    （未知服务名 / 空列表 / timeout 越界）时返回 ``400 {"error": ...}``。
+
+    探测不经过流水线并发闸门：即使服务繁忙也要能报出真实状态。
+    """
+    # 惰性导入：保持 API 层在无重依赖环境下可导入（同 dependencies.py 的既有约定）
+    from ..services.connectivity import MAX_TIMEOUT, MIN_TIMEOUT, SERVICE_KEYS, check_services
+
+    data = payload.model_dump(exclude_unset=True) if payload is not None else {}
+
+    services = data.get("services")
+    if services is not None:
+        if not services:
+            return JSONResponse(status_code=400, content={"error": "services 不能为空列表"})
+        unknown = [name for name in services if name.strip().lower() not in SERVICE_KEYS]
+        if unknown:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"未知服务: {', '.join(unknown)}（可选 {' / '.join(SERVICE_KEYS)}）"
+                },
+            )
+
+    timeout = data.get("timeout")
+    if timeout is not None and not MIN_TIMEOUT <= float(timeout) <= MAX_TIMEOUT:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"timeout 必须在 {MIN_TIMEOUT}~{MAX_TIMEOUT} 秒之间"},
+        )
+
+    return check_services(service.settings, services=services, timeout=timeout)
+
+
+@router.post(
     "/api/prompt_defend",
     response_model=DefendResponse,
     summary="防御流水线：输入检测 ->（可选 RAG）-> 聊天生成 -> 输出检测",
@@ -66,7 +117,8 @@ def prompt_defend(
 ):
     """端到端防御流水线。
 
-    1. 输入不安全 -> 拦截，``stopped_at="input_detection"``；
+    1. 输入不安全 -> 拦截，``stopped_at="input_detection"``（输入检测强度由请求体
+       ``sensitivity`` 决定，缺省取启动默认值 ``DEFAULT_SENSITIVITY``）；
     2. 可选 RAG 增强（``use_rag`` / ``ENABLE_RAG``）-> ``final_prompt``；
     3. 请求未带 ``model_response`` 时，调聊天接口生成回复；
     4. 输入安全且高置信 -> 跳过输出检测，``stopped_at="output_skipped"``；
@@ -83,6 +135,7 @@ def prompt_defend(
             user_input=data["user_input"],
             model_response=data.get("model_response"),
             use_rag=payload.use_rag,
+            sensitivity=payload.sensitivity,
             use_bert=bool(payload.use_bert),
             input_llm_api_url=payload.input_llm_api_url,
             input_llm_api_model=payload.input_llm_api_model,
@@ -90,6 +143,10 @@ def prompt_defend(
             detector_api_key=payload.detector_api_key,
             detector_api_url=payload.detector_api_url,
             detector_model_name=payload.detector_model_name,
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            safe_skip_threshold=payload.safe_skip_threshold,
+            skip_output_when_high_confidence=payload.skip_output_when_high_confidence,
         )
     except ServiceBusyError:
         return JSONResponse(status_code=503, content={"error": "service_busy"})
@@ -191,6 +248,7 @@ async def chat_stream(
         "user_input": data["user_input"],
         "model_response": data.get("model_response"),
         "use_rag": payload.use_rag,
+        "sensitivity": payload.sensitivity,
         "use_bert": bool(payload.use_bert),
         "input_llm_api_url": payload.input_llm_api_url,
         "input_llm_api_model": payload.input_llm_api_model,
@@ -198,6 +256,10 @@ async def chat_stream(
         "detector_api_key": payload.detector_api_key,
         "detector_api_url": payload.detector_api_url,
         "detector_model_name": payload.detector_model_name,
+        "temperature": payload.temperature,
+        "max_tokens": payload.max_tokens,
+        "safe_skip_threshold": payload.safe_skip_threshold,
+        "skip_output_when_high_confidence": payload.skip_output_when_high_confidence,
     }
     return StreamingResponse(
         _sse_event_stream(service, kwargs),

@@ -1,14 +1,28 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { useSessionStore } from '@/stores/session'
 import { formatTime } from '@/utils/format'
 
 const store = useSessionStore()
+const route = useRoute()
+const router = useRouter()
+
+/** 切到某会话的聊天页。侧栏在任意路由下都挂着（如 /settings），
+ *  故导航必须由这里发起——ChatView 在非聊天路由下已卸载，其 currentId 监听不会触发。 */
+function goChat(id: string): void {
+  if (route.path !== `/chat/${id}`) void router.push(`/chat/${id}`)
+}
 
 function onCreate(): void {
-  store.createSession()
+  goChat(store.createSession().id)
+}
+
+function onSelect(id: string): void {
+  store.selectSession(id)
+  goChat(id)
 }
 
 async function onRename(id: string, current: string): Promise<void> {
@@ -53,7 +67,7 @@ async function onDelete(id: string): Promise<void> {
         :key="item.id"
         class="session-item"
         :class="{ 'session-item--active': item.id === store.currentId }"
-        @click="store.selectSession(item.id)"
+        @click="onSelect(item.id)"
       >
         <div class="session-item__row">
           <span class="session-item__title">{{ item.title }}</span>

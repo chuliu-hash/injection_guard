@@ -1,4 +1,4 @@
-import type { ChatStreamRequest, DefendResponse, HealthInfo } from '@/types'
+import type { ChatStreamRequest, DefendResponse, HealthInfo, TestServicesResponse } from '@/types'
 
 import { apiUrl, getJson, postJson } from './http'
 import { postSse } from './sse'
@@ -20,4 +20,12 @@ export function promptDefend(payload: ChatStreamRequest, signal?: AbortSignal): 
 /** 后端健康检查。 */
 export function fetchHealth(signal?: AbortSignal): Promise<HealthInfo> {
   return getJson<HealthInfo>('/health', signal)
+}
+
+/** 测试四个下游模型服务（输入/输出/RAG/聊天）的连通性。 */
+export function testServices(
+  options: { services?: string[]; timeout?: number } = {},
+  signal?: AbortSignal,
+): Promise<TestServicesResponse> {
+  return postJson<TestServicesResponse>('/api/test_services', options, signal)
 }

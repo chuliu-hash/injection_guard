@@ -24,7 +24,6 @@ const route = useRoute()
 const router = useRouter()
 
 const sending = ref(false)
-const useRag = ref(settings.defaultUseRag)
 const drawerVisible = ref(false)
 const focusMessageId = ref<string | null>(null)
 let controller: AbortController | null = null
@@ -78,7 +77,15 @@ async function send(rawText: string): Promise<void> {
 
   try {
     await chatStream(
-      { user_input: text, use_rag: useRag.value },
+      {
+        user_input: text,
+        use_rag: settings.useRag,
+        sensitivity: settings.sensitivity,
+        temperature: settings.chatTemperature,
+        max_tokens: settings.chatMaxTokens,
+        safe_skip_threshold: settings.safeSkipThreshold,
+        skip_output_when_high_confidence: settings.skipOutputWhenHighConfidence,
+      },
       (event, data) => {
         if (event === 'input_detection') {
           const payload = data as InputDetection
@@ -146,10 +153,10 @@ async function send(rawText: string): Promise<void> {
 
     <ChatComposer
       :sending="sending"
-      :use-rag="useRag"
+      :use-rag="settings.useRag"
       @send="send"
       @stop="stop"
-      @update:use-rag="(value: boolean) => (useRag = value)"
+      @update:use-rag="(value: boolean) => (settings.useRag = value)"
     />
 
     <DetectionDrawer
