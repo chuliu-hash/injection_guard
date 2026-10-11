@@ -1,6 +1,53 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { parseSseBuffer } from '@/api/sse'
+import { getAccessToken, registerRefreshHandler, setAccessToken } from '@/api/authToken'
+import { parseSseBuffer, postSse } from '@/api/sse'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  setAccessToken(null)
+  registerRefreshHandler(null)
+})
+
+describe('postSse', () => {
+  it('attaches the bearer token so the streamed endpoint is authorized', async () => {
+    setAccessToken('tok-1')
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response('event: done\ndata: {"is_safe":true}\n\n', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const events: Array<[string, unknown]> = []
+    await postSse({
+      url: '/api/chat_stream',
+      body: { user_input: 'hi' },
+      onEvent: (event, data) => events.push([event, data]),
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok-1')
+    expect(events).toEqual([['done', { is_safe: true }]])
+  })
+
+  it('refreshes once and retries when the stream returns 401', async () => {
+    setAccessToken('expired')
+    registerRefreshHandler(async () => {
+      setAccessToken('fresh')
+      return true
+    })
+    const unauthorized = new Response(JSON.stringify({ error: '未认证' }), { status: 401 })
+    const ok = new Response('event: done\ndata: {}\n\n', { status: 200 })
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized).mockResolvedValueOnce(ok)
+    vi.stubGlobal('fetch', fetchMock)
+
+    await postSse({ url: '/api/chat_stream', body: {}, onEvent: () => {} })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [, retryInit] = fetchMock.mock.calls[1]
+    expect((retryInit.headers as Record<string, string>).Authorization).toBe('Bearer fresh')
+    expect(getAccessToken()).toBe('fresh')
+  })
+})
 
 describe('parseSseBuffer', () => {
   it('parses complete frames and leaves nothing in rest', () => {

@@ -17,7 +17,7 @@ export function setAccessToken(token: string | null): void {
   accessToken = token
 }
 
-export function registerRefreshHandler(handler: () => Promise<boolean>): void {
+export function registerRefreshHandler(handler: (() => Promise<boolean>) | null): void {
   refreshHandler = handler
 }
 

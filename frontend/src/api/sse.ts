@@ -3,7 +3,11 @@
  *
  * 浏览器原生 `EventSource` 只支持 GET，而我们的流式端点是 POST，
  * 因此手动读取 `ReadableStream` 并按 SSE 规范分帧解析。
+ *
+ * 与 `http.ts` 一致：自动附带 `Authorization` 头，401 时刷新令牌并重试一次。
  */
+
+import { getAccessToken, notifyUnauthorized } from './authToken'
 
 export interface RawSseEvent {
   event: string
@@ -67,14 +71,29 @@ export interface PostSseOptions {
   onEvent: (event: string, data: unknown) => void
 }
 
-/** 发起 POST 请求并把 SSE 事件逐个回调给 `onEvent`。 */
-export async function postSse({ url, body, signal, onEvent }: PostSseOptions): Promise<void> {
-  const resp = await fetch(url, {
+function openStream(url: string, body: unknown, signal?: AbortSignal): Promise<Response> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+  }
+  const token = getAccessToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  return fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers,
     body: JSON.stringify(body),
     signal,
+    credentials: 'include', // 同源携带 refresh Cookie
   })
+}
+
+/** 发起 POST 请求并把 SSE 事件逐个回调给 `onEvent`。 */
+export async function postSse({ url, body, signal, onEvent }: PostSseOptions): Promise<void> {
+  let resp = await openStream(url, body, signal)
+  if (resp.status === 401) {
+    const refreshed = await notifyUnauthorized()
+    if (refreshed) resp = await openStream(url, body, signal)
+  }
 
   if (!resp.ok) {
     let message = `请求失败（HTTP ${resp.status}）`

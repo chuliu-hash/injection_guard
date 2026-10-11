@@ -37,3 +37,7 @@ frontend/dist/
 frontend/.vite/
 coverage/
 *.local
+
+# 本地协作 / AI 助手说明文档（不随仓库分发）
+AGENTS.md
+CLAUDE.md
