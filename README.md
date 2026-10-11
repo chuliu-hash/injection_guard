@@ -27,6 +27,28 @@
 | `scripts/` | 各服务的启动脚本 |
 | `tests/` | 自动化测试 |
 
+## 检测模型
+
+系统用到 4 个检测模型。**模型权重不随仓库分发**，请下载后放到对应目录：
+
+| 用途 | 放到的目录 | HuggingFace 地址 |
+|------|-----------|------------------|
+| 输入检测 LLM | `models/LLM/Qwen_prompt_injection` | [xiangxinai/Xiangxin-Guardrails-Text](https://huggingface.co/xiangxinai/Xiangxin-Guardrails-Text) |
+| 输出检测 LLM | `models/LLM/Qwen3-8b` | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) |
+| 输入检测（BERT 分类器） | `models/BERT/mdeberta-prompt-injection-detector` | [chitsii/mdeberta-v2-base-prompt-injections](https://huggingface.co/chitsii/mdeberta-v2-base-prompt-injections)（旧名 `Fan1018/…`，会自动跳转） |
+| 输入检测（BERT 分类器） | `models/BERT/protectai_deberta-v3-base-prompt-injection-v2` | [protectai/deberta-v3-base-prompt-injection-v2](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) |
+
+下载示例（需先 `pip install huggingface_hub`；国内网络可加 `HF_ENDPOINT=https://hf-mirror.com` 加速）：
+
+```bash
+huggingface-cli download xiangxinai/Xiangxin-Guardrails-Text --local-dir models/LLM/Qwen_prompt_injection
+huggingface-cli download Qwen/Qwen3-8B --local-dir models/LLM/Qwen3-8b
+huggingface-cli download chitsii/mdeberta-v2-base-prompt-injections --local-dir models/BERT/mdeberta-prompt-injection-detector
+huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-dir models/BERT/protectai_deberta-v3-base-prompt-injection-v2
+```
+
+> `models/BERT/` 下另有 `fine_tuned_model`、`fine_tuned_model_base` 两个本地微调子模型，无公开下载地址。
+
 ## 环境准备
 
 - Python 3.10+（建议用 conda 环境）
