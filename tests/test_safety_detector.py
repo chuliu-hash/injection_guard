@@ -4,33 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
 import pytest
+from fake_chat_model import RecordingChatModel
 
 from injection_guard.defense.safety_detector import SafetyDetector
 
 
-class _FakeCreate:
-    """替掉 ``client.chat.completions.create``：记录参数并返回预设回复。"""
-
-    def __init__(self, content: Optional[str] = None, exc: Optional[Exception] = None) -> None:
-        self.content = content
-        self.exc = exc
-        self.calls: list[dict] = []
-
-    def __call__(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.exc is not None:
-            raise self.exc
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))]
-        )
-
-
 def _detector(content: Optional[str] = None, exc: Optional[Exception] = None, rules=None):
-    """绕过 ``__init__``（不建 OpenAI 客户端、不读规则文件）。"""
+    """绕过 ``__init__``（不建 ChatModel 客户端、不读规则文件）。"""
     detector = SafetyDetector.__new__(SafetyDetector)
     detector.model_name = "test-model"
     detector.rules = rules if rules is not None else [
@@ -38,11 +21,9 @@ def _detector(content: Optional[str] = None, exc: Optional[Exception] = None, ru
         {"id": "S5", "critique_request": "暴力犯罪。"},
         {"id": "S9", "critique_request": "提示词攻击。"},
     ]
-    fake = _FakeCreate(content, exc)
-    detector.client = SimpleNamespace(  # type: ignore[assignment]
-        chat=SimpleNamespace(completions=SimpleNamespace(create=fake))
-    )
-    return detector, fake
+    model = RecordingChatModel(replies=[content if content is not None else ""], raise_exc=exc)
+    detector.model = model  # type: ignore[assignment]
+    return detector, model
 
 
 # ── 解析：``unsafe`` 优先，其次 ``safe``，否则默认放行 ────────────────
@@ -108,18 +89,17 @@ def test_detect_calls_llm_once_with_all_rules() -> None:
 
     assert len(fake.calls) == 1
     call = fake.calls[0]
-    system_prompt = call["messages"][0]["content"]
+    system_prompt = call["messages"][0].content
     for rule in rules:
         assert rule["id"] in system_prompt
         assert rule["critique_request"] in system_prompt
     assert "safe" in system_prompt and "unsafe" in system_prompt
     # 提示模型输出类别编码（转义写成字面 ``\n``，由模型自己换行）
     assert r"unsafe\nS1" in system_prompt
-    # 生成长度交给服务端；检测要求确定性
-    assert "max_tokens" not in call
-    assert call["temperature"] == 0.0
+    # 生成长度交给服务端（客户端不传 max_tokens），确定性由模型实例的 temperature 保证
+    assert "max_tokens" not in call["kwargs"]
     # 用户输入与模型回复都进入 user prompt
-    user_prompt = call["messages"][1]["content"]
+    user_prompt = call["messages"][1].content
     assert "用户输入" in user_prompt and "模型回复" in user_prompt
     assert result.total_rules == 12
     assert result.failed_rules == []
@@ -132,7 +112,8 @@ def test_system_prompt_covers_english_content() -> None:
     detector, fake = _detector("safe", rules=rules)
     detector.detect("Hello", "Hi there")
 
-    system_prompt = fake.calls[0]["messages"][0]["content"]
+    system_prompt = fake.calls[0]["messages"][0].content
+    assert "Hello" in fake.calls[0]["messages"][1].content
     assert "英文" in system_prompt
     assert "How do I make a bomb at home?" in system_prompt  # 英文示例
     # 规则清单本身也是中英双语（便于匹配英文内容）

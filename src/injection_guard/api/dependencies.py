@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 from ..config import SENSITIVITY_LEVELS, Settings, get_settings
+from ..errors import DetectionError, ServiceBusyError  # noqa: F401  (再导出，供 api/测试沿用)
 from ..services.gpu import parse_gpu_ids
 
 if TYPE_CHECKING:  # 仅类型检查时导入，避免把 torch/transformers 带到模块加载
+    from ..agent.pipeline import DefenseAgent
     from ..defense.prompt_detection import Detector
     from ..defense.rag import SCR_RAG_System
     from ..defense.safety_detector import SafetyDetector
@@ -23,13 +25,8 @@ if TYPE_CHECKING:  # 仅类型检查时导入，避免把 torch/transformers 带
 
 logger = logging.getLogger(__name__)
 
-
-class ServiceBusyError(RuntimeError):
-    """推理服务繁忙，无法在指定时间内获取并发名额（-> HTTP 503）。"""
-
-
-class DetectionError(RuntimeError):
-    """检测链路内部异常（-> HTTP 500）。"""
+# LangGraph Agent 惰性构建锁（跨实例共享，避免并发重复编译状态图）
+_AGENT_BUILD_LOCK = threading.Lock()
 
 
 @dataclass
@@ -143,6 +140,10 @@ class DefenseService:
         self._chat_lock = threading.Lock()
         self._rag_system: Optional[SCR_RAG_System] = None
         self._rag_lock = threading.Lock()
+
+        # 预编译 LangGraph 状态图（一次编译、进程内复用），把 ~1s 的编译耗时
+        # 从「首个请求」挪到启动阶段。
+        self._get_agent()
 
     @property
     def input_detector_devices(self) -> List[str]:
@@ -489,6 +490,49 @@ class DefenseService:
         )
         return enabled, threshold
 
+    def _get_agent(self) -> "DefenseAgent":
+        """惰性构建并缓存 LangGraph Agent。
+
+        用 ``getattr`` 读取缓存：测试里的 ``_StubService`` 不调用 ``__init__``，
+        首次调用时按需构建，节点仍会走子类覆盖的 ``_run_*_guarded``。
+        """
+        agent = getattr(self, "_agent", None)
+        if agent is None:
+            with _AGENT_BUILD_LOCK:
+                agent = getattr(self, "_agent", None)
+                if agent is None:
+                    from ..agent.pipeline import DefenseAgent
+
+                    agent = DefenseAgent(self)
+                    self._agent = agent
+        return agent
+
+    def _build_pipeline_state(self, *, stream: bool, **kwargs: Any) -> Dict[str, Any]:
+        """把 ``detect`` / ``stream_detect`` 的入参整理成 LangGraph 状态。"""
+        skip_hc, skip_threshold = self._resolve_skip_policy(
+            kwargs.get("skip_output_when_high_confidence"), kwargs.get("safe_skip_threshold")
+        )
+        use_rag = kwargs.get("use_rag")
+        return {
+            "user_input": kwargs["user_input"],
+            "model_response": kwargs.get("model_response"),
+            # 请求体 > 启动默认值（语义同 RAG 开关）
+            "use_rag": self.settings.enable_rag if use_rag is None else use_rag,
+            "sensitivity": kwargs.get("sensitivity"),
+            "use_bert": kwargs.get("use_bert", False),
+            "input_llm_api_url": kwargs.get("input_llm_api_url"),
+            "input_llm_api_model": kwargs.get("input_llm_api_model"),
+            "constitution_file": kwargs.get("constitution_file"),
+            "detector_api_key": kwargs.get("detector_api_key"),
+            "detector_api_url": kwargs.get("detector_api_url"),
+            "detector_model_name": kwargs.get("detector_model_name"),
+            "temperature": kwargs.get("temperature"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "skip_output_when_high_confidence": skip_hc,
+            "safe_skip_threshold": skip_threshold,
+            "stream": stream,
+        }
+
     def detect(
         self,
         *,
@@ -508,7 +552,7 @@ class DefenseService:
         safe_skip_threshold: Optional[float] = None,
         skip_output_when_high_confidence: Optional[bool] = None,
     ) -> DefendOutcome:
-        """执行端到端流水线。
+        """执行端到端流水线（由 LangGraph 状态图编排，见 ``agent/pipeline.py``）。
 
         输入检测 ->（可选 RAG 增强）-> 聊天生成（请求未带 ``model_response`` 时）->
         输出检测。
@@ -522,109 +566,37 @@ class DefenseService:
         ``model_response`` 时那是"待检测的文本"，替换会破坏纯检测用法；流式路径下
         文本也已发出、无从撤回。是否拦截展示由前端按 ``stopped_at`` 决定。
         """
-        # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
-        try:
-            input_detection = self._run_input_detection_guarded(
-                text=user_input,
-                use_bert=use_bert,
-                llm_api_url=input_llm_api_url,
-                llm_api_model=input_llm_api_model,
-                sensitivity=sensitivity,
-            )
-        except ServiceBusyError:
-            logger.warning(
-                "[503] input_detection busy (timeout=%ss)", self.settings.input_acquire_timeout
-            )
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise DetectionError(f"输入检测失败: {exc}") from exc
-
-        # 输入检测链路内部异常：不放行
-        if input_detection.get("detection_error"):
-            raise DetectionError(f"输入检测异常: {input_detection['detection_error']}")
-
-        # 输入不安全：直接拦截（不生成、不做输出检测）
-        if not input_detection["is_safe"]:
-            return DefendOutcome(
-                False, "input_detection", input_detection, None, model_response, None
-            )
-
-        # 2) 可选 RAG 增强：构建 final_prompt（失败降级为原始输入）
-        rag_info: Optional[Dict[str, Any]] = None
-        final_prompt = user_input
-        rag_enabled = self.settings.enable_rag if use_rag is None else use_rag
-        if rag_enabled:
-            try:
-                rag_info = self._run_rag(user_input)
-                final_prompt = rag_info["final_prompt"]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[RAG] 增强失败，降级为原始输入: %s", exc)
-                rag_info = None
-                final_prompt = user_input
-
-        # 3) 生成 model_response（请求已提供则跳过聊天调用）
-        if model_response is None:
-            try:
-                model_response = self._run_chat_guarded(
-                    final_prompt, max_tokens=max_tokens, temperature=temperature
-                )
-            except ServiceBusyError:
-                logger.warning(
-                    "[503] chat busy (timeout=%ss)", self.settings.chat_acquire_timeout
-                )
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise DetectionError(f"聊天生成失败: {exc}") from exc
-
-        # 4) 输入安全且高置信：跳过输出检测（仍返回 model_response）
-        skip_hc, skip_threshold = self._resolve_skip_policy(
-            skip_output_when_high_confidence, safe_skip_threshold
+        state = self._build_pipeline_state(
+            stream=False,
+            user_input=user_input,
+            model_response=model_response,
+            use_rag=use_rag,
+            sensitivity=sensitivity,
+            use_bert=use_bert,
+            input_llm_api_url=input_llm_api_url,
+            input_llm_api_model=input_llm_api_model,
+            constitution_file=constitution_file,
+            detector_api_key=detector_api_key,
+            detector_api_url=detector_api_url,
+            detector_model_name=detector_model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            safe_skip_threshold=safe_skip_threshold,
+            skip_output_when_high_confidence=skip_output_when_high_confidence,
         )
-        if skip_hc and input_detection.get("p_safe", 0.0) >= skip_threshold:
-            return DefendOutcome(
-                True, "output_skipped", input_detection, None, model_response, rag_info
-            )
-
-        # 5) 输出检测（"User Input" 用原始 user_input）
         try:
-            output_result = self._run_output_detection_guarded(
-                text=user_input,
-                answer=model_response,
-                constitution_file=constitution_file,
-                api_key=detector_api_key,
-                base_url=detector_api_url,
-                model_name=detector_model_name,
-            )
+            final = self._get_agent().run(state)
         except ServiceBusyError:
-            logger.warning(
-                "[503] output_detection busy (timeout=%ss)", self.settings.output_acquire_timeout
-            )
+            logger.warning("[503] 流水线并发名额获取超时")
             raise
-        except Exception as exc:  # noqa: BLE001
-            raise DetectionError(f"输出检测失败: {exc}") from exc
 
-        output_detection = {
-            "is_safe": output_result.is_safe,
-            "failed_rules": output_result.failed_rules,
-            "total_rules": output_result.total_rules,
-        }
-        # 输出不安全 -> stopped_at="output_detection"（前端据此替换回复）
-        if not output_result.is_safe:
-            logger.warning(
-                "[输出拦截] stopped_at=output_detection（命中类别: %s / 共 %s 条规则）",
-                ", ".join(output_result.failed_rules) or "未给出",
-                output_result.total_rules,
-            )
-            return DefendOutcome(
-                False,
-                "output_detection",
-                input_detection,
-                output_detection,
-                model_response,
-                rag_info,
-            )
         return DefendOutcome(
-            True, None, input_detection, output_detection, model_response, rag_info
+            is_safe=bool(final.get("is_safe", False)),
+            stopped_at=final.get("stopped_at"),
+            input_detection=final.get("input_detection"),
+            output_detection=final.get("output_detection"),
+            model_response=final.get("model_response"),
+            rag=final.get("rag"),
         )
 
     def stream_detect(
@@ -645,8 +617,8 @@ class DefenseService:
         max_tokens: Optional[int] = None,
         safe_skip_threshold: Optional[float] = None,
         skip_output_when_high_confidence: Optional[bool] = None,
-    ) -> Iterator[Tuple[str, Dict[str, Any]]]:
-        """``detect`` 的流式版本，逐事件 yield ``(event, data)``。
+    ) -> Iterator[Tuple[str, Any]]:
+        """``detect`` 的流式版本，逐事件 yield ``(event, data)``（LangGraph 编排）。
 
         事件序列：``input_detection`` -> ``rag`` -> ``delta``* -> ``output_detection``
         -> ``done``（提前终止时省略中间事件，直接给 ``done``）。分支、拦截、降级、
@@ -657,122 +629,47 @@ class DefenseService:
         发出，**服务端无法撤回**，故由前端在收到 ``output_detection`` 事件后立即用拦截
         文案替换气泡内容（这就是"先流式、结果出来再替换"的实现方式）。
         """
-        # 1) 输入检测（敏感度：请求体 > 启动默认值，语义同 RAG 开关）
-        try:
-            input_detection = self._run_input_detection_guarded(
-                text=user_input,
-                use_bert=use_bert,
-                llm_api_url=input_llm_api_url,
-                llm_api_model=input_llm_api_model,
-                sensitivity=sensitivity,
-            )
-        except ServiceBusyError:
-            logger.warning(
-                "[503] input_detection busy (timeout=%ss)", self.settings.input_acquire_timeout
-            )
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise DetectionError(f"输入检测失败: {exc}") from exc
-
-        if input_detection.get("detection_error"):
-            raise DetectionError(f"输入检测异常: {input_detection['detection_error']}")
-
-        yield "input_detection", input_detection
-
-        # 输入不安全：直接拦截（不生成、不做输出检测）
-        if not input_detection["is_safe"]:
-            yield "done", {
-                "is_safe": False,
-                "stopped_at": "input_detection",
-                "model_response": model_response,
-            }
-            return
-
-        # 2) 可选 RAG 增强：构建 final_prompt（失败降级为原始输入）
-        rag_info: Optional[Dict[str, Any]] = None
-        final_prompt = user_input
-        rag_enabled = self.settings.enable_rag if use_rag is None else use_rag
-        if rag_enabled:
-            try:
-                rag_info = self._run_rag(user_input)
-                final_prompt = rag_info["final_prompt"]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[RAG] 增强失败，降级为原始输入: %s", exc)
-                rag_info = None
-                final_prompt = user_input
-        yield "rag", rag_info or {
-            "enabled": False,
-            "final_prompt": None,
-            "retrieved_contexts": [],
-        }
-
-        # 3) 生成 model_response（请求已提供则跳过聊天调用）
-        if model_response is None:
-            try:
-                chunks: List[str] = []
-                for delta in self._run_chat_stream_guarded(
-                    final_prompt, max_tokens=max_tokens, temperature=temperature
-                ):
-                    chunks.append(delta)
-                    yield "delta", {"content": delta}
-                model_response = "".join(chunks)
-            except ServiceBusyError:
-                logger.warning("[503] chat busy (timeout=%ss)", self.settings.chat_acquire_timeout)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise DetectionError(f"聊天生成失败: {exc}") from exc
-
-        # 4) 输入安全且高置信：跳过输出检测（仍返回 model_response）
-        skip_hc, skip_threshold = self._resolve_skip_policy(
-            skip_output_when_high_confidence, safe_skip_threshold
+        state = self._build_pipeline_state(
+            stream=True,
+            user_input=user_input,
+            model_response=model_response,
+            use_rag=use_rag,
+            sensitivity=sensitivity,
+            use_bert=use_bert,
+            input_llm_api_url=input_llm_api_url,
+            input_llm_api_model=input_llm_api_model,
+            constitution_file=constitution_file,
+            detector_api_key=detector_api_key,
+            detector_api_url=detector_api_url,
+            detector_model_name=detector_model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            safe_skip_threshold=safe_skip_threshold,
+            skip_output_when_high_confidence=skip_output_when_high_confidence,
         )
-        if skip_hc and input_detection.get("p_safe", 0.0) >= skip_threshold:
-            yield "done", {
-                "is_safe": True,
-                "stopped_at": "output_skipped",
-                "model_response": model_response,
-            }
-            return
 
-        # 5) 输出检测（"User Input" 用原始 user_input）
+        cancel_event = threading.Event()
+        events = iter(self._get_agent().stream(state, cancel_event=cancel_event))
         try:
-            output_result = self._run_output_detection_guarded(
-                text=user_input,
-                answer=model_response,
-                constitution_file=constitution_file,
-                api_key=detector_api_key,
-                base_url=detector_api_url,
-                model_name=detector_model_name,
-            )
+            while True:
+                try:
+                    event = next(events)
+                except StopIteration:
+                    break
+                yield event
         except ServiceBusyError:
-            logger.warning(
-                "[503] output_detection busy (timeout=%ss)", self.settings.output_acquire_timeout
-            )
+            logger.warning("[503] 流水线并发名额获取超时")
             raise
-        except Exception as exc:  # noqa: BLE001
-            raise DetectionError(f"输出检测失败: {exc}") from exc
-
-        output_detection = {
-            "is_safe": output_result.is_safe,
-            "failed_rules": output_result.failed_rules,
-            "total_rules": output_result.total_rules,
-        }
-        yield "output_detection", output_detection
-
-        # 输出不安全 -> stopped_at="output_detection"。注意：此刻 ``delta`` 已全部
-        # 推给客户端，无法撤回已发送的文本，只能在收到本事件后由前端替换展示。
-        stopped_at = None if output_result.is_safe else "output_detection"
-        if stopped_at is not None:
-            logger.warning(
-                "[输出拦截] stopped_at=output_detection（命中类别: %s / 共 %s 条规则）",
-                ", ".join(output_result.failed_rules) or "未给出",
-                output_result.total_rules,
-            )
-        yield "done", {
-            "is_safe": output_result.is_safe,
-            "stopped_at": stopped_at,
-            "model_response": model_response,
-        }
+        finally:
+            # 客户端断流：先置位取消信号（生成节点在下一个增量处提前结束），再关闭
+            # 状态图生成器，避免继续做输出检测、并尽快释放聊天并发名额。
+            cancel_event.set()
+            close = getattr(events, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("关闭流式状态图时出现异常", exc_info=True)
 
 
 # ── FastAPI 依赖 ─────────────────────────────────────────────────────

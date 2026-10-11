@@ -14,6 +14,18 @@ sqlalchemy>=2.0
 pyjwt>=2.8
 bcrypt>=4.0
 
+# Agent 编排 + RAG（LangChain 生态）
+# langgraph：检测流水线的状态图编排（节点 / 条件边 / 自定义事件流）
+# langchain（含 langchain-core）：Embeddings / VectorStore / Retriever 接口层
+# langchain-openai：ChatModel 接入 OpenAI 兼容接口（聊天生成 + 检测 LLM 复审）；
+#   它按官方 API 发 max_completion_tokens，llm_server 已兼容该字段名
+# langchain-community + faiss-cpu：FAISS 向量索引（langchain-faiss 需 Python>=3.11）
+langgraph>=1.0,<2
+langchain>=1.0,<2
+langchain-community>=0.4,<1
+langchain-openai>=1.0,<2
+faiss-cpu>=1.9
+
 # ── 模型推理：以下为**已验证可共存**的版本组合，勿随意升级 ──────────────
 # 版本互相钳制，任一处变动都可能破坏推理（详见 CLAUDE.md「模型推理依赖」）：
 #   * transformers 5.x 运行时需要 torch>=2.6（用了 torch.accelerator）；

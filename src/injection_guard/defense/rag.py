@@ -1,6 +1,12 @@
-"""RAG 安全上下文：检索相似的安全示例，拼装防御性 prompt。
+"""RAG 安全上下文（LangChain 实现）：检索相似安全示例，拼装防御性 prompt。
 
-首次运行时从 json 构建向量库并缓存为 .pt，
+企业级 RAG 流程：
+
+1. **Embeddings** —— ``LocalEmbeddings`` 适配本地 OpenAI 兼容的 ``/v1/embeddings``；
+2. **VectorStore** —— ``langchain_community.vectorstores.FAISS`` 承载向量索引；
+3. **Retriever** —— ``store.as_retriever(...)`` 做相似度检索，返回 ``Document``。
+
+首次运行时从 JSON 构建向量索引并缓存为 ``.pt``（同时向下兼容旧格式缓存），
 之后直接加载缓存，并支持增量追加新攻击样本。
 """
 
@@ -10,14 +16,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import requests
 import torch
-from sentence_transformers import util
+from langchain_core.embeddings import Embeddings
+from langchain_core.vectorstores import VectorStore
 
 from ..config import get_settings
-from ..url_utils import join_endpoint
+from .embeddings import LocalEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -32,32 +38,36 @@ class RAGPromptResult:
 
 
 class SCR_RAG_System:
+    """安全上下文检索系统：LangChain Embeddings + FAISS 向量库 + Retriever。"""
+
     def __init__(
         self,
         db_path: Optional[str] = None,
         embed_path: Optional[str] = None,
         api_url: Optional[str] = None,
         model_name: Optional[str] = None,
+        *,
+        embeddings: Optional[Embeddings] = None,
     ) -> None:
-        """初始化系统（基于 OpenAI 协议的轻量级客户端）。"""
+        """初始化系统。
+
+        ``embeddings`` 可注入自定义 ``Embeddings``（测试用桩）；缺省使用
+        ``LocalEmbeddings`` 指向配置里的本地 embedding 服务。
+        """
         settings = get_settings()
         self.db_path = str(db_path or settings.rag_db_path)
         self.embed_path = str(embed_path or settings.rag_embed_path)
         self.api_url = api_url or settings.embed_api_url
         self.model_name = model_name or settings.embed_model_name
 
-        self.knowledge_base: List[Dict] = []
-        self._embedding_matrix = None
-
-        # HTTP Session 复用（连接池）
-        self._http_session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=4,
-            pool_maxsize=8,
-            max_retries=0,
+        self.embeddings: Embeddings = embeddings or LocalEmbeddings(
+            api_url=self.api_url, model_name=self.model_name
         )
-        self._http_session.mount("http://", adapter)
-        self._http_session.mount("https://", adapter)
+        # 知识库条目：[{"prompt": 攻击样例, "response": 安全回答}]
+        self.knowledge_base: List[Dict] = []
+        # 与 knowledge_base 一一对应的向量矩阵（持久化用）
+        self._embedding_matrix: Optional[torch.Tensor] = None
+        self._store: Optional[VectorStore] = None
 
         if not os.path.exists(self.embed_path):
             logger.info("检测到首次运行，开始全量构建向量数据库 ...")
@@ -66,28 +76,10 @@ class SCR_RAG_System:
             logger.info("检测到已有编译知识库，直接加载 ...")
             self.load_knowledge_base()
 
-    def _get_embeddings_from_api(self, texts: List[str]) -> torch.Tensor:
-        """向本地 API 发送符合 OpenAI 标准的请求，并解析结果。"""
-        payload = {"input": texts, "model": self.model_name}
-        headers = {"Content-Type": "application/json"}
+    # ── 向量库构建 / 加载 ────────────────────────────────────────────
 
-        try:
-            response = self._http_session.post(
-                join_endpoint(self.api_url, "/embeddings"), json=payload, headers=headers
-            )
-            response.raise_for_status()
-
-            # 按 OpenAI 格式解析：数据在 "data" 数组中，每个元素的 "embedding" 字段是向量
-            response_json = response.json()
-            embeddings_list = [item["embedding"] for item in response_json["data"]]
-
-            return torch.tensor(embeddings_list, dtype=torch.float32)
-
-        except requests.exceptions.RequestException as exc:
-            logger.error("调用 Embedding API 失败: %s", exc)
-            raise
-
-    def build_vector_db_from_json(self, batch_size: int = 16, max_prompt_chars: int = 8192) -> None:
+    def build_vector_db_from_json(self, max_prompt_chars: int = 8192) -> None:
+        """从 JSON 全量构建向量索引并落盘缓存。"""
         if not os.path.exists(self.db_path):
             logger.error("未找到原始数据文件 %s，无法构建知识库。", self.db_path)
             return
@@ -103,79 +95,120 @@ class SCR_RAG_System:
 
         # 截断过长的 prompt，避免单条请求过大
         truncated_prompts = [item["prompt"][:max_prompt_chars] for item in raw_db]
+        vectors = self.embeddings.embed_documents(truncated_prompts)
 
-        all_embeddings = []
-        total = len(truncated_prompts)
+        self.knowledge_base = [
+            {"prompt": item["prompt"], "response": item["safe_response"]} for item in raw_db
+        ]
+        self._embedding_matrix = torch.tensor(vectors, dtype=torch.float32)
 
-        for i in range(0, total, batch_size):
-            batch = truncated_prompts[i : i + batch_size]
-            batch_emb = self._get_embeddings_from_api(batch)
-            all_embeddings.append(batch_emb)
-
-        embeddings = torch.cat(all_embeddings, dim=0)
-
-        self.knowledge_base = []
-        for i, item in enumerate(raw_db):
-            self.knowledge_base.append(
-                {"prompt": item["prompt"], "response": item["safe_response"], "vector": embeddings[i]}
-            )
-
-        torch.save(self.knowledge_base, self.embed_path)
+        self._build_index()
+        self._persist()
         logger.info("知识库构建完成，已保存至 %s", self.embed_path)
-        self._update_embedding_matrix()
 
     def load_knowledge_base(self) -> None:
-        """加载统一的 .pt 知识库文件。"""
-        if os.path.exists(self.embed_path):
-            logger.info("正在加载知识库 %s ...", self.embed_path)
-            self.knowledge_base = torch.load(self.embed_path)
-            self._update_embedding_matrix()
-            logger.info("成功加载！当前防御库容量: %d 条安全上下文。", len(self.knowledge_base))
-        else:
+        """加载编译后的 ``.pt`` 知识库（兼容旧版 list[dict] 格式）。"""
+        if not os.path.exists(self.embed_path):
             self.knowledge_base = []
             self._embedding_matrix = None
+            self._store = None
             logger.warning("未找到编译后的知识库 %s！", self.embed_path)
+            return
 
-    def _update_embedding_matrix(self) -> None:
-        """将列表中的离散向量堆叠为 2D 张量矩阵，保证检索速度。"""
-        if self.knowledge_base:
-            vectors = [item["vector"] for item in self.knowledge_base]
-            self._embedding_matrix = torch.stack(vectors)
+        logger.info("正在加载知识库 %s ...", self.embed_path)
+        # 缓存文件由本项目自己写入（含 tensor），故显式关闭 weights_only 限制
+        payload = torch.load(self.embed_path, weights_only=False)
+        self.knowledge_base, self._embedding_matrix = self._normalize_payload(payload)
+        self._build_index()
+        logger.info("成功加载！当前防御库容量: %d 条安全上下文。", len(self.knowledge_base))
+
+    @staticmethod
+    def _normalize_payload(payload: object) -> Tuple[List[Dict], Optional[torch.Tensor]]:
+        """把新旧两种缓存格式统一成 ``(知识库条目, 向量矩阵)``。"""
+        if isinstance(payload, dict) and "vectors" in payload:  # 新格式
+            prompts = list(payload.get("prompts", []))
+            responses = list(payload.get("responses", []))
+            knowledge_base = [
+                {"prompt": prompt, "response": response}
+                for prompt, response in zip(prompts, responses, strict=False)
+            ]
+            return knowledge_base, payload["vectors"]
+
+        if isinstance(payload, (list, tuple)):  # 旧格式：list[{"prompt","response","vector"}]
+            knowledge_base = [
+                {"prompt": item["prompt"], "response": item["response"]} for item in payload
+            ]
+            vectors = torch.stack([item["vector"] for item in payload]) if payload else None
+            return knowledge_base, vectors
+
+        logger.warning("知识库缓存格式无法识别，按空库处理。")
+        return [], None
+
+    def _build_index(self) -> None:
+        """用内存中的文本 + 向量装配 FAISS 向量库。"""
+        if not self.knowledge_base or self._embedding_matrix is None:
+            self._store = None
+            logger.warning("知识库为空，向量索引未构建。")
+            return
+
+        # FAISS 集成目前仍由 langchain-community 提供（独立的 langchain-faiss 要求
+        # Python>=3.11，本项目为 3.10），故按 `langchain-community<1` 锁定。
+        from langchain_community.vectorstores import FAISS
+
+        text_embeddings = [
+            (item["prompt"], vector)
+            for item, vector in zip(
+                self.knowledge_base, self._embedding_matrix.tolist(), strict=False
+            )
+        ]
+        metadatas = [{"response": item["response"]} for item in self.knowledge_base]
+        self._store = FAISS.from_embeddings(text_embeddings, self.embeddings, metadatas=metadatas)
+
+    def _persist(self) -> None:
+        """把知识库文本与向量矩阵写入 ``.pt`` 缓存。"""
+        if self._embedding_matrix is None:
+            return
+        payload = {
+            "prompts": [item["prompt"] for item in self.knowledge_base],
+            "responses": [item["response"] for item in self.knowledge_base],
+            "vectors": self._embedding_matrix,
+        }
+        parent = os.path.dirname(os.path.abspath(self.embed_path))
+        os.makedirs(parent, exist_ok=True)
+        torch.save(payload, self.embed_path)
 
     def add_new_attack_context(self, attack_type: str, prompt: str, response: str) -> None:
-        """动态增量更新，追加新数据及其向量。"""
-        if self._embedding_matrix is None and not self.knowledge_base:
-            self.load_knowledge_base()
-
+        """动态增量更新：追加新数据及其向量并持久化。"""
         logger.info("正在为新型攻击 [%s] 计算特征向量 ...", attack_type)
-        new_embedding = self._get_embeddings_from_api([prompt])[0]
+        vector = torch.tensor(self.embeddings.embed_documents([prompt]), dtype=torch.float32)
 
-        new_record = {"prompt": prompt, "response": response, "vector": new_embedding}
-        self.knowledge_base.append(new_record)
+        self.knowledge_base.append({"prompt": prompt, "response": response})
+        if self._embedding_matrix is None:
+            self._embedding_matrix = vector
+        else:
+            self._embedding_matrix = torch.cat([self._embedding_matrix, vector], dim=0)
 
-        self._update_embedding_matrix()
-        torch.save(self.knowledge_base, self.embed_path)
+        self._build_index()
+        self._persist()
         logger.info("增量更新成功，已持久化至 %s", self.embed_path)
 
+    # ── 检索 / Prompt 构造 ───────────────────────────────────────────
+
     def retrieve(self, user_query: str, top_k: int = 2) -> List[Dict]:
-        """计算相似度，返回命中的字典（含文本与对应回答）。"""
-        if self._embedding_matrix is None or len(self.knowledge_base) == 0:
+        """用 LangChain Retriever 检索，返回命中的安全示例（含文本与对应回答）。"""
+        if self._store is None or not self.knowledge_base:
             logger.warning("知识库为空，无法进行检索。")
             return []
 
-        # 将用户的实时查询转换为向量
-        query_embedding = self._get_embeddings_from_api([user_query])
-        # 动态将查询向量对齐到知识库矩阵所在的设备
-        query_embedding = query_embedding.to(self._embedding_matrix)
-
-        # 计算余弦相似度
-        cos_scores = util.cos_sim(query_embedding, self._embedding_matrix)[0]
-
-        # 寻找得分最高的 Top-K
-        actual_top_k = min(top_k, len(self.knowledge_base))
-        top_results = torch.topk(cos_scores, k=actual_top_k).indices.tolist()
-
-        return [self.knowledge_base[idx] for idx in top_results]
+        retriever = self._store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": min(top_k, len(self.knowledge_base))},
+        )
+        documents = retriever.invoke(user_query)
+        return [
+            {"prompt": doc.page_content, "response": doc.metadata.get("response", "")}
+            for doc in documents
+        ]
 
     def construct_safe_prompt(
         self, user_query: str, top_k: int = 1, pre_retrieved_contexts: Optional[List[Dict]] = None

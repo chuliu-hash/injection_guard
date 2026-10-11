@@ -16,16 +16,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import torch
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from ..config import SENSITIVITY_LEVELS, get_settings
-from ..url_utils import join_endpoint
+from ..llm_utils import message_text
 from .confidence_vote import confidence_weighted_vote
 from .risk_mapping import CATEGORY_NAMES, RISK_LEVEL_MAPPING
 
 logger = logging.getLogger(__name__)
+
+# LLM 复审的单轮用户消息模板
+LLM_REVIEW_PROMPT = ChatPromptTemplate.from_messages([("human", "{text}")])
 
 # 敏感度档位与阈值表：可经请求体 ``sensitivity`` **逐次**指定（缺省取 ``Settings.default_sensitivity``）。
 # 阈值只在单次调用内以局部变量参与判定，故同一个 Detector 实例可被并发请求复用，
@@ -106,15 +110,18 @@ class Detector:
         self.llm_api_model = llm_api_model or settings.input_detector_api_model
         self.llm_api_timeout = llm_api_timeout
 
-        # HTTP Session 复用（连接池，减少 TCP 握手开销）
-        self._http_session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=4,
-            pool_maxsize=8,
-            max_retries=0,
+        # LLM 复审走 LangChain ChatModel（OpenAI 兼容）；logprobs 用于取首 token 置信度，
+        # 生成长度由推理服务决定（客户端不传 max_tokens）。本地服务无鉴权 -> 占位 key。
+        self._llm_model = ChatOpenAI(
+            model=self.llm_api_model,
+            base_url=self.llm_api_url,
+            api_key="EMPTY",
+            timeout=self.llm_api_timeout,
+            temperature=0.0,
+            top_p=0.9,
+            logprobs=True,
+            top_logprobs=1,
         )
-        self._http_session.mount("http://", adapter)
-        self._http_session.mount("https://", adapter)
 
         # 敏感度基线（启动默认值）；单次调用可经 detect_* 的 sensitivity 参数覆盖
         self.set_sensitivity(settings.default_sensitivity)
@@ -344,37 +351,18 @@ class Detector:
         )
         start_time = time.time()
         try:
-            payload = {
-                "model": self.llm_api_model,
-                "messages": [{"role": "user", "content": text}],
-                # 生成长度由推理服务（INPUT_API_SERVER_MAX_NEW_TOKENS）决定，客户端不指定。
-                "temperature": 0.0,
-                "top_p": 0.9,
-                "stream": False,
-                "logprobs": True,
-                "top_logprobs": 1,
-            }
-
-            resp = self._http_session.post(
-                join_endpoint(self.llm_api_url, "/chat/completions"),
-                json=payload,
-                timeout=self.llm_api_timeout,
-            )
-            if resp.status_code != 200:
-                logger.error("[Detector] LLM API 错误 %s: %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-
-            data = resp.json()
-            choice = data.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content", "").strip()
+            # 生成长度由推理服务（INPUT_API_SERVER_MAX_NEW_TOKENS）决定，客户端不指定。
+            response = self._llm_model.invoke(LLM_REVIEW_PROMPT.format_messages(text=text))
+            content = message_text(response.content).strip()
 
             text_is_unsafe = ("unsafe" in content.lower()) or content.startswith("unsafe")
             llm_raw_prediction = 1 if text_is_unsafe else 0
 
-            # 安全地提取 logprob 置信度
+            # 安全地提取 logprob 置信度（LangChain 把 choices[0].logprobs 放进 response_metadata）
             confidence_score = 1.0
             try:
-                first_token = choice.get("logprobs", {}).get("content", [{}])[0]
+                logprobs = response.response_metadata.get("logprobs") or {}
+                first_token = logprobs.get("content", [{}])[0]
                 if first_token and first_token.get("logprob") is not None:
                     confidence_score = math.exp(first_token["logprob"])
             except (IndexError, AttributeError, TypeError):

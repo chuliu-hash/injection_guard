@@ -58,12 +58,21 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     model: str = "llama2-finetuned"
     max_tokens: Optional[int] = 1024
+    # OpenAI 现行字段名（langchain-openai 等新客户端发的是这个）；与 max_tokens 等价，
+    # 两者同时出现时以 max_completion_tokens 为准。
+    max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
     n: Optional[int] = 1
     stream: Optional[bool] = False
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = None
+
+    def effective_max_tokens(self) -> Optional[int]:
+        """请求体的生成长度上限（兼容 max_tokens / max_completion_tokens 两种字段名）。"""
+        if self.max_completion_tokens is not None:
+            return self.max_completion_tokens
+        return self.max_tokens
 
 
 class ChatCompletionChoice(BaseModel):
@@ -454,7 +463,7 @@ def _prepare_generation(
 
     # 3. 生成配置
     # 请求 max_tokens 优先；服务端上限（若设置）只作硬顶，None 表示不设上限
-    requested_max_tokens = request.max_tokens or max_new_tokens_limit or 1024
+    requested_max_tokens = request.effective_max_tokens() or max_new_tokens_limit or 1024
     max_new_tokens = (
         min(requested_max_tokens, max_new_tokens_limit)
         if max_new_tokens_limit is not None

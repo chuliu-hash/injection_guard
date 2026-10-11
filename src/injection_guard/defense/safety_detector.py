@@ -15,14 +15,20 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from openai import OpenAI
+from langchain_core.messages import BaseMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 
 from ..config import get_settings
+from ..llm_utils import message_text
 
 logger = logging.getLogger(__name__)
 
 # 判定回复里的类别编码（如 ``unsafe\nS5`` → S5）
 _CATEGORY_RE = re.compile(r"S\d{1,2}")
+
+# system / user 两条消息的模板（具体内容由 ``_build_messages`` 渲染后注入）
+SAFETY_PROMPT = ChatPromptTemplate.from_messages([("system", "{system_prompt}"), ("human", "{user_prompt}")])
 
 
 @dataclass
@@ -101,10 +107,14 @@ Prediction:
         self.request_timeout = settings.output_detector_timeout
         self.api_key = api_key or settings.output_detector_api_key or "EMPTY"
 
-        self.client = OpenAI(
-            api_key=self.api_key,
+        # LangChain ChatModel：检测要求确定性（temperature=0），生成长度交给服务端
+        # （不传 max_tokens，由 <服务>_API_SERVER_MAX_NEW_TOKENS 决定）。
+        self.model = ChatOpenAI(
+            model=self.model_name,
             base_url=self.base_url,
+            api_key=self.api_key,
             timeout=self.request_timeout,
+            temperature=0.0,
         )
         rules_file = constitution_file or settings.critique_requests_path
         self.rules = self._load_rules(rules_file)
@@ -135,15 +145,16 @@ Prediction:
             lines.append(f"- {rule_id} {instruction}".rstrip())
         return "\n".join(lines)
 
-    def _build_messages(self, text: str, answer: str) -> List[Dict]:
-        """构造 messages 列表（12 条规则一次性放进 system prompt）。"""
-        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(rules=self._format_rules())
-        user_prompt = self.USER_PROMPT_TEMPLATE.format(text=text, answer=answer)
+    def _build_messages(self, text: str, answer: str) -> List[BaseMessage]:
+        """用 ``ChatPromptTemplate`` 渲染 messages（12 条规则一次性放进 system prompt）。
 
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        规则清单 / 待检测内容先各自 ``str.format`` 再作为**模板变量值**注入，
+        避免文件内容里的花括号被 LangChain 模板二次解析。
+        """
+        return SAFETY_PROMPT.format_messages(
+            system_prompt=self.SYSTEM_PROMPT_TEMPLATE.format(rules=self._format_rules()),
+            user_prompt=self.USER_PROMPT_TEMPLATE.format(text=text, answer=answer),
+        )
 
     def _extract_categories(self, content: str) -> List[str]:
         """从判定回复里取出命中的类别编码（``unsafe\\nS5`` → ``["S5"]``）。
@@ -170,12 +181,8 @@ Prediction:
             return DetectionResult(True, [], 0)
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self._build_messages(text, answer),
-                temperature=0.0,
-            )
-            content = (response.choices[0].message.content or "").strip()
+            response = self.model.invoke(self._build_messages(text, answer))
+            content = message_text(response.content).strip()
         except Exception as exc:  # noqa: BLE001 - 检测失败默认放行
             logger.warning("输出检测调用出错（默认放行）: %s", exc)
             return DetectionResult(True, [], len(self.rules))
