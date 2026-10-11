@@ -132,3 +132,28 @@ export interface TestServicesResponse {
   timeout: number
   services: Partial<Record<ServiceKey, ServiceProbeResult>>
 }
+
+// ── 认证 ──────────────────────────────────────────────────────────────
+
+/** 当前登录用户（对应后端 `api/schemas.py::UserModel`，不含密码）。 */
+export interface User {
+  id: string
+  username: string
+  is_active: boolean
+  created_at: number
+}
+
+/** 登录 / 注册 / 刷新的统一响应；refresh token 走 httpOnly Cookie，不出现在此处。 */
+export interface AuthTokenResponse {
+  access_token: string
+  token_type: string
+  expires_in: number
+  user: User
+}
+
+export interface LoginPayload {
+  username: string
+  password: string
+}
+
+export type RegisterPayload = LoginPayload

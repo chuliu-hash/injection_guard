@@ -27,6 +27,10 @@ models/
 .ruff_cache/
 .mypy_cache/
 
+# 会话持久化数据库（SQLite，运行时生成）
+data/
+*.sqlite3
+
 # 前端（Node）
 node_modules/
 frontend/dist/

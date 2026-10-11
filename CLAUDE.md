@@ -398,8 +398,19 @@ frontend/  (Vue 3 + Vite + TS + Pinia + Element Plus)   —— 独立 npm 工程
 - `test_stream_pipeline.py`：`DefenseService.stream_detect` 的事件序列（子类化 + 桩替换各步骤），
   含输出不安全时 `delta` 先发完、`done` 以 `stopped_at="output_detection"` 收尾。
 - `test_stream_api.py`：`TestClient` 打 `/api/chat_stream`，断言 `text/event-stream`、事件序列、缺字段→400 JSON、繁忙→`error` 事件。
+- `test_sessions_api.py`：会话/消息/检测记录持久化（临时 SQLite）：完整生命周期、标题自动生成、
+  删除级联、清空、未登录 401，以及**跨用户隔离**。
+- `test_auth_api.py`：JWT 鉴权（临时 SQLite）：注册 / 登录 / 刷新轮换 / 退出、令牌保护（401）、
+  口令错误不泄露账号存在性、关闭注册 403、`all_devices` 退出后旧令牌立即失效。
 
 前端用 Vitest（`cd frontend && npm test`，jsdom 环境）：`api/sse.spec.ts`（分帧解析）、`stores/session.spec.ts`（会话 CRUD）、
 `utils/markdown.spec.ts`（Markdown 渲染 + XSS 消毒）。
+
+会话数据由**服务端持久化**（`persistence/`，SQLAlchemy；`api/session_routes.py` 暴露 `/api/sessions*`），
+前端 `stores/session.ts` 仅做缓存与乐观更新——流式增量只改本地，结束时 `patchMessage`/`putDetection` 落库。
+
+鉴权：`auth/`（bcrypt + JWT）、`api/auth_routes.py`（`/api/auth/*`）、`api/security.py`（`get_current_user`
+等依赖）。除 `/health` 与 `/api/auth/*` 外全部接口需 `Authorization: Bearer`；令牌带 `ver` 与
+`users.token_version` 比对以支持吊销。
 
 `pyproject.toml` 的 `[tool.pytest.ini_options]` 设了 `pythonpath=["src"]`；`tests/conftest.py` 也会把 `src/` 插入 `sys.path`。

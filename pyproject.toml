@@ -17,6 +17,11 @@ dependencies = [
     "openai>=1.0",
     "numpy",
     "requests",
+    # 会话/消息持久化（SQLite 默认，生产可切 PostgreSQL；PG 驱动需另装 psycopg[binary]）
+    "sqlalchemy>=2.0",
+    # 登录鉴权：PyJWT 签发/校验访问令牌；bcrypt 哈希口令
+    "pyjwt>=2.8",
+    "bcrypt>=4.0",
     # 模型推理相关：以下为**已验证可共存**的组合，勿随意升级（详见 requirements.txt 注释）。
     # transformers 5.x 需 torch>=2.6，但 GPTQ 加载所需的 gptqmodel 在 torch 2.6
     # 只有 manylinux_2_28 内核 wheel（本机 glibc 2.27 不可用），故整体停在 4.x + torch 2.5。

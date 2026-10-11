@@ -14,7 +14,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .. import __version__
 from ..config import get_settings
 from ..logging_config import setup_logging
+from ..persistence.database import get_database
+from .auth_routes import router as auth_router
 from .routes import router
+from .session_routes import router as sessions_router
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,16 @@ def create_app() -> FastAPI:
     settings = get_settings()
     setup_logging(settings.log_level)
 
+    # 建会话持久化表（幂等）。失败即启动失败，避免运行期才发现存储不可用。
+    database = get_database()
+    database.create_all()
+    logger.info("会话数据库就绪: %s", database.database_url)
+
+    if settings.jwt_secret_key.startswith("insecure-dev-secret-change-me"):
+        logger.warning(
+            "JWT_SECRET_KEY 仍为默认值，请在生产环境显式设置（openssl rand -hex 32）"
+        )
+
     app = FastAPI(title="AI Safety Defense API", version=__version__)
 
     @app.exception_handler(RequestValidationError)
@@ -56,6 +69,8 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=400, content={"error": _validation_error_message(exc)})
 
     app.include_router(router)
+    app.include_router(auth_router)
+    app.include_router(sessions_router)
 
     # 可选 CORS：逗号分隔的 CORS_ORIGINS；留空则同源部署（默认）。
     origins = [o.strip() for o in (settings.cors_origins or "").split(",") if o.strip()]

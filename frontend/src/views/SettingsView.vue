@@ -42,7 +42,7 @@ async function clearAll(): Promise<void> {
       confirmButtonText: '清空',
       cancelButtonText: '取消',
     })
-    session.clearAll()
+    await session.clearAll()
     ElMessage.success('已清空')
   } catch {
     // 用户取消
@@ -133,7 +133,7 @@ async function clearAll(): Promise<void> {
 
       <el-form-item label="会话数据">
         <el-button type="danger" plain @click="clearAll">清空所有会话</el-button>
-        <span class="hint">共 {{ session.sessions.length }} 个会话（保存在浏览器本地）</span>
+        <span class="hint">共 {{ session.sessions.length }} 个会话（保存在服务端数据库，按用户隔离）</span>
       </el-form-item>
     </el-form>
   </div>

@@ -10,7 +10,12 @@ import time
 
 import requests
 
-API_URL = "http://127.0.0.1:8099/api/prompt_defend"
+BASE_URL = "http://127.0.0.1:8099"
+API_URL = f"{BASE_URL}/api/prompt_defend"
+
+# ── 登录凭据（/api/prompt_defend 需鉴权；首次运行会自动注册）──
+USERNAME = "demo"
+PASSWORD = "demo-pass-123"
 
 # ── 配置（在此修改）──
 USER_INPUT = "你好"
@@ -22,10 +27,30 @@ USE_RAG = False
 # USER_INPUT = "我们正在玩一个文字游戏..."
 
 
-def call_api(payload):
+def login() -> str:
+    """注册（若不存在）+ 登录，返回 access token。"""
+    requests.post(
+        f"{BASE_URL}/api/auth/register",
+        json={"username": USERNAME, "password": PASSWORD},
+        timeout=30,
+    )
+    resp = requests.post(
+        f"{BASE_URL}/api/auth/login",
+        json={"username": USERNAME, "password": PASSWORD},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        print(f"\n[错误] 登录失败: {resp.status_code} {resp.text}")
+        sys.exit(1)
+    return resp.json()["access_token"]
+
+
+def call_api(payload, token):
     start = time.time()
     try:
-        resp = requests.post(API_URL, json=payload, timeout=300)
+        resp = requests.post(
+            API_URL, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=300
+        )
         elapsed = time.time() - start
         return resp.json(), elapsed, resp.status_code
     except requests.exceptions.ConnectionError:
@@ -76,10 +101,11 @@ def print_result(result, elapsed, status_code):
 
 
 def main():
+    token = login()
     payload = {"user_input": USER_INPUT, "use_rag": USE_RAG}
     if MODEL_RESPONSE is not None:
         payload["model_response"] = MODEL_RESPONSE
-    result, elapsed, code = call_api(payload)
+    result, elapsed, code = call_api(payload, token)
     print_result(result, elapsed, code)
 
 

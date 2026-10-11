@@ -38,11 +38,52 @@ src/injection_guard/
 ├── api/                 # 防御 API（app 工厂 / 路由 / schemas / 服务层依赖）
 ├── defense/             # 检测核心（BERT 组 + LLM 复审 / 输出检测 / RAG）
 ├── services/            # 推理服务（LLM / Embedding）与跨进程 GPU 分配、聊天客户端
+├── auth/                # 认证原语：bcrypt 口令哈希 + JWT 签发/校验
+├── persistence/         # 持久化：用户 / 会话 / 消息模型、仓储、引擎（按 user_id 隔离）
 └── cli/                 # 四个命令行入口（含 deploy 一键部署）
+data/                    # 运行时 SQLite 库（默认，勿入库）
 resources/               # 随代码分发的数据（宪法规则等）
 scripts/                 # 手工联调客户端
 tests/                   # pytest 单测
 ```
+
+## 会话持久化
+
+会话 / 消息 / 检测记录**保存在服务端数据库**（不再依赖浏览器 localStorage）：默认 SQLite 文件
+（`DATABASE_URL`，见 `.env.example`），生产可切 PostgreSQL。所有读写按**登录用户**做隔离——
+换设备不丢、多端可见、按账号隔离。前端仅缓存，权威数据在服务端。
+
+```
+GET    /api/auth/me                               # 当前登录用户
+POST   /api/auth/register                         # 注册（ALLOW_REGISTRATION=false 时 403）
+POST   /api/auth/login                            # 登录 -> access token（refresh 走 httpOnly Cookie）
+POST   /api/auth/refresh                          # 用 refresh Cookie 换新 access token（轮换）
+POST   /api/auth/logout                           # 退出（all_devices=true 吊销该用户全部令牌）
+
+GET    /api/sessions                              # 会话列表（含消息数）
+POST   /api/sessions                              # 新建会话
+DELETE /api/sessions                              # 清空当前用户全部会话
+GET    /api/sessions/{id}                         # 会话详情（含消息与检测记录）
+PATCH  /api/sessions/{id}                         # 重命名
+DELETE /api/sessions/{id}                         # 删除（级联消息与检测记录）
+POST   /api/sessions/{id}/messages                # 追加消息
+PATCH  /api/sessions/{id}/messages/{mid}          # 更新消息（内容/状态/错误）
+PUT    /api/sessions/{id}/messages/{mid}/detection# 写入 / 覆盖检测记录
+```
+
+## 登录鉴权
+
+除 `/health` 与 `/api/auth/*` 外，所有接口都需 **`Authorization: Bearer <access token>`**，
+缺失 / 过期 / 被吊销返回 `401`。令牌方案：
+
+- **access token**（JWT / HS256，默认 30 分钟）：体返回，前端放内存，随请求头发送；
+- **refresh token**（默认 7 天）：以 **httpOnly Cookie** 下发（JS 不可读，抗 XSS），
+  仅用于 `/api/auth/refresh` 换取新 access token，且每次刷新**轮换**；
+- 两者都带 `ver`（用户令牌版本），与 `users.token_version` 不符即失效——「退出所有设备」/改密可立即吊销。
+
+口令用 **bcrypt** 加盐哈希存储（`auth/passwords.py`），明文永不落库。**生产必须设置
+`JWT_SECRET_KEY`**（`openssl rand -hex 32`），否则沿用不安全的开发默认值并启动告警；
+HTTPS 部署请置 `COOKIE_SECURE=true`。
 
 ## 安装
 
@@ -96,7 +137,7 @@ GPU_IDS=0,1 scripts/serve_embed.sh  # 临时指定 GPU
 
 ## 前端（Web AI Agent 聊天助手）
 
-`frontend/` 是 Vue 3 + Vite + TypeScript 的聊天助手，接入后端安全护栏（流式）：
+`frontend/` 是 Vue 3 + Vite + TypeScript 的聊天助手（**需登录**），接入后端安全护栏（流式）：
 
 ```bash
 cd frontend
@@ -108,7 +149,8 @@ npm run lint && npm run type-check && npm test
 
 - 逐字流式输出；输入检测 / RAG 增强 / 输出检测结果**不内联显示**，统一在会话级「检测记录」抽屉查看；
 - 输出检测判不安全时，收到 `output_detection` 事件即刻用拦截文案替换该条气泡（「先流式、结果出来再替换」）；
-- RAG 开关、多会话历史（浏览器 localStorage 持久化）；
+- 登录 / 注册（JWT：access token 存内存 + refresh httpOnly Cookie），路由守卫拦截未登录访问；
+- RAG 开关、多会话历史（**服务端持久化**，见「会话持久化」；按用户隔离、多端同步）；
 - 设置页「服务连通性」：一键测试输入 / 输出 / RAG / 聊天四个模型服务的连接与可用性。
 
 详见 [`frontend/README.md`](frontend/README.md)。

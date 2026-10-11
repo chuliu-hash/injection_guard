@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -10,18 +11,22 @@ const store = useSessionStore()
 const route = useRoute()
 const router = useRouter()
 
+onMounted(() => {
+  void store.ensureLoaded()
+})
+
 /** 切到某会话的聊天页。侧栏在任意路由下都挂着（如 /settings），
  *  故导航必须由这里发起——ChatView 在非聊天路由下已卸载，其 currentId 监听不会触发。 */
 function goChat(id: string): void {
   if (route.path !== `/chat/${id}`) void router.push(`/chat/${id}`)
 }
 
-function onCreate(): void {
-  goChat(store.createSession().id)
+async function onCreate(): Promise<void> {
+  goChat((await store.createSession()).id)
 }
 
-function onSelect(id: string): void {
-  store.selectSession(id)
+async function onSelect(id: string): Promise<void> {
+  await store.selectSession(id)
   goChat(id)
 }
 
@@ -32,7 +37,7 @@ async function onRename(id: string, current: string): Promise<void> {
       confirmButtonText: '确定',
       cancelButtonText: '取消',
     })) as { value: string }
-    store.renameSession(id, result.value)
+    await store.renameSession(id, result.value)
   } catch {
     // 用户取消
   }
@@ -45,7 +50,7 @@ async function onDelete(id: string): Promise<void> {
       confirmButtonText: '删除',
       cancelButtonText: '取消',
     })
-    store.deleteSession(id)
+    await store.deleteSession(id)
     ElMessage.success('已删除')
   } catch {
     // 用户取消

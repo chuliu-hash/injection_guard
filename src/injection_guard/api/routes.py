@@ -19,6 +19,7 @@ from .dependencies import (
     validate_defend_request,
 )
 from .schemas import DefendRequest, DefendResponse, TestServicesRequest, TestServicesResponse
+from .security import require_user
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def health(service: DefenseService = Depends(get_defense_service)) -> dict:
     "/api/test_services",
     response_model=TestServicesResponse,
     summary="连通性测试：输入/输出/RAG/聊天 四个下游模型服务",
+    dependencies=[Depends(require_user)],
 )
 def test_services(
     payload: Optional[TestServicesRequest] = None,
@@ -110,6 +112,7 @@ def test_services(
     "/api/prompt_defend",
     response_model=DefendResponse,
     summary="防御流水线：输入检测 ->（可选 RAG）-> 聊天生成 -> 输出检测",
+    dependencies=[Depends(require_user)],
 )
 def prompt_defend(
     payload: Optional[DefendRequest] = None,
@@ -228,6 +231,7 @@ async def _sse_event_stream(service: DefenseService, kwargs: Dict[str, Any]):
 @router.post(
     "/api/chat_stream",
     summary="流式防御流水线（SSE）：输入检测 ->（可选 RAG）-> 流式聊天 -> 输出检测",
+    dependencies=[Depends(require_user)],
 )
 async def chat_stream(
     payload: Optional[DefendRequest] = None,

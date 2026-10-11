@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from injection_guard.api.app import create_app
 from injection_guard.api.dependencies import ServiceBusyError, get_defense_service
+from injection_guard.api.security import get_current_user
 
 
 class _StubService:
@@ -27,6 +28,8 @@ class _BusyService:
 def _client(service) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_defense_service] = lambda: service
+    # 鉴权已由 auth 测试覆盖，这里只测 SSE：桩掉当前用户
+    app.dependency_overrides[get_current_user] = lambda: object()
     return TestClient(app)
 
 

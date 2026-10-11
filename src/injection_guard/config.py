@@ -36,6 +36,10 @@ SENSITIVITY_LEVELS = ("low", "medium", "high")
 # 运行时服务参数文件（绝对路径）：访问/连接项在 .env，各服务的调参/并发/生成参数在此。
 _SERVICES_ENV_FILE = _REPO_ROOT / "configs" / "services.env"
 
+# 会话/消息持久化数据库的默认位置（SQLite 文件，随仓库的 data/ 目录）。
+# 生产可改 DATABASE_URL 指向 PostgreSQL（如 postgresql+psycopg://user:pw@host/db）。
+_DEFAULT_DB_PATH = _REPO_ROOT / "data" / "injection_guard.db"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -59,6 +63,33 @@ class Settings(BaseSettings):
     frontend_dist_dir: Path = _REPO_ROOT / "frontend" / "dist"
     # 逗号分隔的允许跨域来源；留空则不加 CORS 中间件（同源部署无需）。
     cors_origins: Optional[str] = None
+
+    # ── 会话持久化（多用户隔离）──────────────────────────────────────
+    # 会话/消息/检测记录的存储后端。默认 SQLite 文件；生产切 PostgreSQL 只需改此值，
+    # 例如：DATABASE_URL=postgresql+psycopg://user:pw@host:5432/injection_guard
+    database_url: str = f"sqlite:///{_DEFAULT_DB_PATH}"
+    # 会话标题自动生成的最大长度（取首条用户消息前若干字符）。
+    session_title_max_len: int = 20
+
+    # ── 认证 / JWT ────────────────────────────────────────────────────
+    # 签名密钥：**生产必须显式设置**（如 `openssl rand -hex 32`）；保持默认值会启动告警。
+    # 默认值仅供本地开发（≥32 字节）；生产必须显式设置，否则启动时告警
+    jwt_secret_key: str = "insecure-dev-secret-change-me-0123456789"
+    jwt_algorithm: str = "HS256"
+    # access token 有效期（分钟）：短时效，前端放内存、随 Authorization 头发送。
+    access_token_expire_minutes: int = 30
+    # refresh token 有效期（天）：以 httpOnly Cookie 下发，仅用于换取新 access token。
+    refresh_token_expire_days: int = 7
+    # 刷新 Cookie 名称与作用路径（限定在认证接口，减少暴露面）。
+    refresh_cookie_name: str = "ig_refresh_token"
+    refresh_cookie_path: str = "/api/auth"
+    # HTTPS 部署应置 True（Cookie 仅经 TLS 传输）；本地 http 调试保持 False。
+    cookie_secure: bool = False
+    cookie_samesite: str = "lax"
+    # 是否允许自助注册（公网/生产可关闭，改由管理员建号）。
+    allow_registration: bool = True
+    # 密码最短长度（bcrypt 上限 72 字节）。
+    password_min_length: int = 8
 
     # ── 路径 ──────────────────────────────────────────────────────────
     # 以下路径均**显式指定**（不再经 MODEL_ROOT / RESOURCES_DIR 间接派生）。

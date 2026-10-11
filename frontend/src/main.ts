@@ -9,7 +9,9 @@ import 'highlight.js/styles/github.css'
 import '@/styles/main.css'
 
 import App from './App.vue'
+import { registerRefreshHandler } from './api/authToken'
 import { router } from './router'
+import { useAuthStore } from './stores/auth'
 
 const app = createApp(App)
 
@@ -24,4 +26,8 @@ pinia.use(piniaPluginPersistedstate)
 app.use(pinia)
 app.use(router)
 app.use(ElementPlus)
+
+// http 层 401 时用 refresh Cookie 换新令牌（注册在 pinia 就绪之后）
+registerRefreshHandler(() => useAuthStore().refreshSession())
+
 app.mount('#app')

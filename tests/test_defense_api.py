@@ -18,6 +18,7 @@ from injection_guard.api.dependencies import (
     get_defense_service,
     validate_defend_request,
 )
+from injection_guard.api.security import get_current_user
 from injection_guard.services import connectivity
 
 
@@ -56,6 +57,8 @@ class _FakeService:
 def _client(service: _FakeService) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_defense_service] = lambda: service
+    # 鉴权已由 auth 测试覆盖，这里只测流水线：桩掉当前用户
+    app.dependency_overrides[get_current_user] = lambda: object()
     return TestClient(app)
 
 

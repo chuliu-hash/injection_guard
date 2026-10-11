@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -126,3 +126,113 @@ class TestServicesResponse(BaseModel):
     ok: bool
     timeout: float
     services: Dict[str, ServiceProbeResult]
+
+
+# ── 会话持久化（/api/sessions*）───────────────────────────────────────
+# 会话/消息/检测记录落库、按用户隔离；wire 格式沿用 snake_case，前端在 api 层转 camelCase。
+
+
+class SessionSummary(BaseModel):
+    """会话列表项（不含消息正文）。"""
+
+    id: str
+    title: str
+    created_at: int
+    updated_at: int
+    message_count: int
+
+
+class ChatMessageModel(BaseModel):
+    id: str
+    role: str
+    content: str
+    status: str
+    error: Optional[str] = None
+    created_at: int
+
+
+class DetectionRecordModel(BaseModel):
+    """助手消息对应的检测记录（三段结构原样透传）。"""
+
+    is_safe: bool
+    stopped_at: Optional[str] = None
+    input_detection: Optional[Dict[str, Any]] = None
+    rag: Optional[Dict[str, Any]] = None
+    output_detection: Optional[Dict[str, Any]] = None
+
+
+class SessionDetail(SessionSummary):
+    messages: List[ChatMessageModel] = []
+    # 以助手消息 id 为键的检测记录
+    detections: Dict[str, DetectionRecordModel] = {}
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary]
+
+
+class CreateSessionRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+class CreateMessageRequest(BaseModel):
+    role: str
+    content: Optional[str] = None
+    status: Optional[str] = None
+
+
+class PatchMessageRequest(BaseModel):
+    content: Optional[str] = None
+    status: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ClearSessionsResponse(BaseModel):
+    deleted: int
+
+
+# ── 认证（/api/auth*）────────────────────────────────────────────────
+
+
+class UserModel(BaseModel):
+    """对外的用户信息（**不含密码哈希**）。"""
+
+    id: str
+    username: str
+    is_active: bool
+    created_at: int
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    """可选：非浏览器客户端可显式带 refresh_token；缺省则读 httpOnly Cookie。"""
+
+    refresh_token: Optional[str] = None
+
+
+class LogoutRequest(BaseModel):
+    """``all_devices=True`` 时递增令牌版本，吊销该用户全部令牌。"""
+
+    all_devices: bool = False
+
+
+class TokenResponse(BaseModel):
+    """登录 / 注册 / 刷新的统一响应。access_token 由前端内存持有；refresh 走 Cookie。"""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: UserModel

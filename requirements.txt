@@ -8,6 +8,11 @@ pydantic-settings>=2.1
 openai>=1.0
 numpy
 requests
+# 会话/消息持久化（SQLite 默认；切 PostgreSQL 另装 psycopg[binary]）
+sqlalchemy>=2.0
+# 登录鉴权（JWT + bcrypt 口令哈希）
+pyjwt>=2.8
+bcrypt>=4.0
 
 # ── 模型推理：以下为**已验证可共存**的版本组合，勿随意升级 ──────────────
 # 版本互相钳制，任一处变动都可能破坏推理（详见 CLAUDE.md「模型推理依赖」）：

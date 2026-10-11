@@ -35,14 +35,10 @@ const detections = computed(() => session.value?.detections ?? {})
 const BLOCKED_TEXT = '该消息未通过安全检测，已被拦截。'
 const OUTPUT_BLOCKED_TEXT = '该回复未通过输出安全检测，已被拦截。'
 
-onMounted(() => {
+onMounted(async () => {
   const param = route.params.sessionId
-  if (typeof param === 'string' && store.sessions.some((s) => s.id === param)) {
-    store.selectSession(param)
-  } else {
-    store.ensureSession()
-    if (store.currentId) void router.replace(`/chat/${store.currentId}`)
-  }
+  const session = await store.activate(typeof param === 'string' ? param : undefined)
+  if (route.params.sessionId !== session.id) void router.replace(`/chat/${session.id}`)
 })
 
 watch(
@@ -65,10 +61,10 @@ async function send(rawText: string): Promise<void> {
   const text = rawText.trim()
   if (!text || sending.value) return
 
-  const current = store.ensureSession()
+  const current = await store.ensureSession()
   const sessionId = current.id
-  store.appendMessage(sessionId, 'user', text)
-  const assistant = store.appendMessage(sessionId, 'assistant', '')
+  await store.appendMessage(sessionId, 'user', text)
+  const assistant = await store.appendMessage(sessionId, 'assistant', '')
 
   const record: DetectionRecord = { isSafe: true, stoppedAt: null }
   let streamError: string | null = null
@@ -104,7 +100,7 @@ async function send(rawText: string): Promise<void> {
           // 「检测结果一出来就中断」——立即用拦截文案替换气泡内容。
           if (!payload.is_safe) {
             record.stoppedAt = 'output_detection'
-            store.patchMessage(sessionId, assistant.id, { content: OUTPUT_BLOCKED_TEXT })
+            void store.patchMessage(sessionId, assistant.id, { content: OUTPUT_BLOCKED_TEXT })
           }
         } else if (event === 'done') {
           const payload = data as DonePayload
@@ -122,19 +118,19 @@ async function send(rawText: string): Promise<void> {
       ?.messages.find((m) => m.id === assistant.id)
 
     if (streamError) {
-      store.patchMessage(sessionId, assistant.id, { status: 'error', error: streamError })
+      await store.patchMessage(sessionId, assistant.id, { status: 'error', error: streamError })
       ElMessage.error(streamError)
     } else if (record.stoppedAt === 'input_detection' && !message?.content) {
-      store.patchMessage(sessionId, assistant.id, { content: BLOCKED_TEXT, status: 'done' })
+      await store.patchMessage(sessionId, assistant.id, { content: BLOCKED_TEXT, status: 'done' })
     } else {
-      store.patchMessage(sessionId, assistant.id, { status: 'done' })
+      await store.patchMessage(sessionId, assistant.id, { status: 'done' })
     }
-    store.attachDetection(sessionId, assistant.id, record)
+    await store.attachDetection(sessionId, assistant.id, record)
   } catch (error) {
     const aborted = controller?.signal.aborted === true
     const text2 = aborted ? '已停止生成' : error instanceof Error ? error.message : String(error)
-    store.patchMessage(sessionId, assistant.id, { status: 'error', error: text2 })
-    store.attachDetection(sessionId, assistant.id, record)
+    await store.patchMessage(sessionId, assistant.id, { status: 'error', error: text2 })
+    await store.attachDetection(sessionId, assistant.id, record)
     if (!aborted) ElMessage.error(text2)
   } finally {
     sending.value = false

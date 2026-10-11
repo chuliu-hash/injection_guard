@@ -5,7 +5,7 @@ Vue 3 + Vite + TypeScript 的聊天助手，接入后端**安全护栏**（`POST
 - 逐字流式输出；
 - **输入检测 / RAG 增强 / 输出检测**结果可视化，但**不在聊天区自动内联显示**，
   统一在会话级 **「检测记录」抽屉** 中查看；
-- RAG 开关、多会话历史（浏览器 localStorage 持久化）。
+- RAG 开关、多会话历史（**服务端持久化**：`/api/sessions`，按用户隔离、多端同步）。
 
 ## 环境要求
 
@@ -21,6 +21,7 @@ npm run dev          # http://127.0.0.1:5173，/api 与 /health 代理到后端 
 ```
 
 后端需先启动：`python -m injection_guard.cli.serve_defense`（见仓库根 README）。
+首次访问会跳转登录页（`/login`）：可直接**注册**（后端 `ALLOW_REGISTRATION=false` 时需管理员建号）。
 
 ## 构建与部署
 
@@ -46,14 +47,14 @@ npm run format       # Prettier
 
 ```
 src/
-├── api/          # http 封装 / POST-SSE 解析 / 业务接口
+├── api/          # http 封装（含 Bearer 与 401 自动刷新）/ POST-SSE 解析 / 认证与会话接口
 ├── components/   # 会话列表、消息、输入框、检测记录抽屉等
 ├── layouts/      # 应用外壳
-├── router/       # 路由（/chat、/settings）
-├── stores/       # Pinia：会话历史、设置（持久化）
+├── router/       # 路由（/login、/chat、/settings）+ 登录守卫
+├── stores/       # Pinia：认证（内存 access token）、会话（服务端权威 + 内存缓存）、设置（localStorage）
 ├── types/        # 与后端 schemas / SSE 事件契约对应的类型
 ├── utils/        # Markdown 渲染（含 XSS 消毒）、格式化
-└── views/        # ChatView / SettingsView
+└── views/        # LoginView / ChatView / SettingsView
 ```
 
 ## SSE 事件契约
@@ -71,3 +72,16 @@ src/
 
 > 因端点为 POST，浏览器原生 `EventSource` 不适用，故使用 `fetch` + `ReadableStream` 手动解析 SSE
 > （见 `src/api/sse.ts`）。
+
+## 会话持久化
+
+会话 / 消息 / 检测记录保存在**服务端**（`/api/sessions`，见仓库根 README「会话持久化」），
+浏览器不再持有权威数据：切换会话时按需拉取详情，流式增量只改本地缓存、结束时统一落库。
+
+## 登录鉴权
+
+- 登录 / 注册后，**access token 只存内存**（`api/authToken.ts`），随 `Authorization` 头发送；
+  **refresh token 在 httpOnly Cookie**（JS 不可读），刷新页面时由 `stores/auth.ts` 自动恢复会话。
+- `api/http.ts` 收到 401 会触发一次自动刷新并重试原请求；失败则清空登录态。
+- 路由守卫（`router/index.ts`）拦截未登录访问并跳 `/login?redirect=...`；
+  `App.vue` 对公开路由不套应用外壳，避免未登录时发起受保护请求。
