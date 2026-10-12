@@ -25,7 +25,7 @@ async function onLogout(): Promise<void> {
 
     <el-container>
       <el-header class="layout__header">
-        <div class="layout__title">AI 安全护栏 · 聊天助手</div>
+        <div class="layout__title">InjectionGuard · LLM 安全护栏</div>
         <div class="layout__right">
           <BackendStatus />
           <router-link to="/settings">

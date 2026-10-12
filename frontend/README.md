@@ -1,6 +1,6 @@
-# injection_guard 前端 · Web AI Agent 聊天助手
+# InjectionGuard 前端 · LLM 安全护栏控制台
 
-Vue 3 + Vite + TypeScript 的聊天助手，接入后端**安全护栏**（`POST /api/chat_stream`，SSE 流式）：
+Vue 3 + Vite + TypeScript 的对话控制台，接入后端**安全护栏**（`POST /api/chat_stream`，SSE 流式）：
 
 - 逐字流式输出；
 - **输入检测 / RAG 增强 / 输出检测**结果可视化，但**不在聊天区自动内联显示**，

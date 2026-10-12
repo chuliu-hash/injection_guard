@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "injection_guard Web 聊天助手前端（Vue 3 + Vite + TypeScript）",
+  "description": "InjectionGuard LLM 安全护栏前端（Vue 3 + Vite + TypeScript）",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

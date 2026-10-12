@@ -59,7 +59,7 @@ def create_app() -> FastAPI:
             "JWT_SECRET_KEY 仍为默认值，请在生产环境显式设置（openssl rand -hex 32）"
         )
 
-    app = FastAPI(title="AI Safety Defense API", version=__version__)
+    app = FastAPI(title="InjectionGuard · LLM Guardrails API", version=__version__)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_request_validation_error(

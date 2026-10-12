@@ -38,7 +38,7 @@ async function submit(): Promise<void> {
 <template>
   <div class="login">
     <el-card class="login__card">
-      <h2 class="login__title">AI 安全护栏 · 聊天助手</h2>
+      <h2 class="login__title">InjectionGuard · LLM 安全护栏</h2>
       <p class="login__subtitle">{{ mode === 'login' ? '登录以继续' : '注册新账号' }}</p>
 
       <el-form label-position="top" @submit.prevent="submit">

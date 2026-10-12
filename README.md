@@ -1,36 +1,85 @@
-# injection_guard
+# InjectionGuard · LLM 安全护栏平台
 
-面向大模型（LLM）的**安全防御系统**：在聊天过程中自动拦截提示注入 / 越狱等风险。
+面向大模型（LLM）的**安全护栏**：对输入与输出做双向检测，自动拦截提示注入 / 越狱等风险。
 
 - 检查**用户输入**是否包含注入、越狱等攻击意图；
 - 检查**模型输出**是否违反安全规则；
-- 自带网页版聊天助手（前端）与可替换的本地推理服务。
+- 自带网页版**对话控制台**（前端）与可替换的本地推理服务。
 
-一句话：给聊天机器人套上「输入检测 → 生成回复 → 输出检测」的安全护栏，任一环节判定不安全即拦截。
+一句话：给大模型应用套上「输入检测 → 生成回复 → 输出检测」的安全护栏，任一环节判定不安全即拦截。
 
 ## 主要功能
 
 - 输入、输出**双向检测**，只放行通过检查的内容；
+- 流式回复**每约 512 token 增量检测一次**，命中即中断生成（`OUTPUT_DETECT_INTERVAL_TOKENS` 可调 / 关闭）；
 - 可选**检索增强（RAG）**，用安全示例引导模型；
-- **网页聊天助手**：流式输出、多会话历史、每条回复的检测结果可查；
+- **对话控制台**：流式输出、多会话历史、每条回复的检测结果可查；
 - **多用户账号**：注册登录后各看各的数据；
 - 模型服务地址可配置，本地部署或调用云端均可。
 
 ## 技术架构
 
 - **后端**：Python 3.10 + FastAPI，JWT 登录鉴权（访问令牌 + HttpOnly 刷新 Cookie），SQLAlchemy 会话持久化（默认 SQLite，可切 PostgreSQL）。
-- **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」，流式场景由状态图逐节点推送事件（SSE）。
+- **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」；流式生成每约 512 token 增量检测一次、命中即中断，事件经状态图逐节点推送（SSE）。
 - **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库、Retriever 检索安全示例，检索失败自动降级为原始输入。
 - **模型调用**：聊天生成、输入/输出检测的 LLM 调用统一走 LangChain `ChatOpenAI` + `ChatPromptTemplate`（本地服务或云端接口均可，OpenAI 兼容）。
 - **推理服务**：本地自研的 OpenAI 兼容 LLM / Embedding 推理服务（FastAPI + transformers）。
 - **前端**：Vue 3 + Vite + TypeScript。
+
+## 核心代码走读（想读源码的初学者看）
+
+只想用起来可以跳过本节。下面三段是项目里最关键的代码，都摘自真实文件，可对照阅读。
+
+**1）调用大模型：统一走 LangChain 的 `ChatOpenAI`**（`src/injection_guard/services/chat_client.py:47`）
+
+```python
+self.model = ChatOpenAI(
+    model=self.model_name,        # 模型名
+    base_url=self.base_url,       # 例如 http://localhost:8097/v1
+    api_key=self.api_key,         # 本地服务不校验；留空时代码用 "EMPTY" 占位
+    timeout=self.timeout,
+)
+# 发一次请求；bind() 只覆盖「本次调用」的参数（前端调温度 / 生成长度时用）
+response = self._bind_model(max_tokens, temperature).invoke(messages)
+```
+
+- 为什么只给 `base_url`：OpenAI 兼容服务都遵循同一套 HTTP 协议（`/chat/completions`），
+  所以换成本地服务或云端只改配置，代码不用动；
+- 流式回复用 `model.stream(messages)` 逐块 `yield`，网页上的打字机效果就来自这里。
+
+**2）RAG 检索：Embeddings → FAISS → Retriever**（`src/injection_guard/defense/rag.py:165`、`:203`）
+
+```python
+# 用已经算好的向量建索引（不重复调用 embedding 服务）
+self._store = FAISS.from_embeddings(text_embeddings, self.embeddings, metadatas=metadatas)
+# 检索最相似的安全示例，返回 list[Document]
+retriever = self._store.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
+documents = retriever.invoke(user_query)
+```
+
+检索到的示例会被拼进最终 prompt（安全指令 + 相似示例 + 当前问题），检索失败自动降级为原始输入。
+
+**3）检测流水线：LangGraph 状态图**（`src/injection_guard/agent/pipeline.py:239`）
+
+```python
+builder = StateGraph(PipelineState)                  # 状态 = 请求参数 + 各阶段产物
+builder.add_node("input_detection", bind(input_detection_node))
+# 输入不安全 → 直接 END，不再执行后续阶段
+builder.add_conditional_edges("input_detection", route_after_input, {"stop": END, "rag": "rag_retrieval"})
+```
+
+- 节点（Node）= 一个步骤，条件边（Conditional Edge）= 分支；流程一眼可见，每个节点可单独测试；
+- 流式请求用 `stream_mode=["custom", "values"]` 逐节点把事件推给前端（SSE）。
+
+按这个顺序读代码最省力：`services/chat_client.py`（调模型）→ `defense/rag.py`（检索）
+→ `agent/pipeline.py`（编排）→ `api/dependencies.py`（并发控制与断流取消）。
 
 ## 目录一览
 
 | 位置 | 说明 |
 |------|------|
 | `src/injection_guard/` | 后端服务（Python / FastAPI） |
-| `frontend/` | 网页聊天助手（Vue 3 + Vite） |
+| `frontend/` | 对话控制台（Vue 3 + Vite） |
 | `models/` | 本地模型权重（需自行放置） |
 | `configs/` | 运行配置（端口、模型路径、服务参数） |
 | `scripts/` | 各服务的启动脚本 |
@@ -150,6 +199,6 @@ cd frontend && npm test     # 前端测试
 
 - `.env`：访问地址、连接信息、密钥等（复制 `.env.example`）。
 - `configs/deploy.env`：本地部署的端口与模型路径（复制 `deploy.env.example`）。
-- `configs/services.env`：各模型服务的检测参数（复制 `services.env.example`）。
+- `configs/services.env`：各模型服务的检测参数（复制 `services.env.example`），例如 `OUTPUT_DETECT_INTERVAL_TOKENS`。
 
 所有示例文件均以 `.example` 结尾：复制为**同名文件**后按需修改即可，真实配置不会进入版本库。
