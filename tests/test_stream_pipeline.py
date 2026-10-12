@@ -16,6 +16,7 @@ def _settings(**over):
         rag_top_k=2,
         skip_output_when_high_confidence=False,
         safe_skip_threshold=0.5,
+        output_detect_interval_tokens=0,
         input_acquire_timeout=1,
         output_acquire_timeout=1,
         chat_acquire_timeout=1,
@@ -171,6 +172,61 @@ def test_provided_response_skips_chat_and_delta():
     assert "delta" not in _names(events)
     assert svc.chat_prompts == []
     assert events[-1][1]["model_response"] == "已有回复"
+
+
+def test_stream_incremental_output_detection_intercepts_mid_generation():
+    """每累计约 512 token 检测一次：命中不安全立刻中断生成并推 output_detection。"""
+    svc = _StubService(
+        _settings(output_detect_interval_tokens=512),
+        input_result=SAFE_INPUT,
+        output_result=SimpleNamespace(is_safe=False, failed_rules=["S5"], total_rules=12),
+        chat_chunks=("安" * 600, "全" * 600),
+    )
+    events = _collect(svc, user_input="你好")
+
+    assert _names(events) == ["input_detection", "rag", "delta", "output_detection", "done"]
+    assert len(svc.output_calls) == 1
+    assert svc.output_calls[0]["answer"] == "安" * 600
+    assert events[-1] == (
+        "done",
+        {"is_safe": False, "stopped_at": "output_detection", "model_response": "安" * 600},
+    )
+
+
+def test_stream_incremental_output_detection_keeps_generating_when_safe():
+    """增量检测都安全：仍会生成完整回复，收尾再做一次整段检测。"""
+    svc = _StubService(
+        _settings(output_detect_interval_tokens=512),
+        input_result=SAFE_INPUT,
+        chat_chunks=("安" * 600, "安" * 600, "尾"),
+    )
+    events = _collect(svc, user_input="你好")
+
+    assert _names(events) == [
+        "input_detection",
+        "rag",
+        "delta",
+        "delta",
+        "delta",
+        "output_detection",
+        "done",
+    ]
+    assert len(svc.output_calls) == 3   # 2 次增量 + 1 次收尾
+    assert events[-1][1]["model_response"] == "安" * 1200 + "尾"
+
+
+def test_stream_incremental_detection_disabled_when_interval_zero():
+    svc = _StubService(_settings(output_detect_interval_tokens=0), input_result=SAFE_INPUT)
+    events = _collect(svc, user_input="你好")
+    assert _names(events) == [
+        "input_detection",
+        "rag",
+        "delta",
+        "delta",
+        "output_detection",
+        "done",
+    ]
+    assert len(svc.output_calls) == 1   # 只有收尾那一次
 
 
 def test_output_unsafe_marks_done_stopped_at_output_detection():

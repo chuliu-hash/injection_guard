@@ -11,6 +11,9 @@
 ``DefenseService`` 的并发受控方法（``_run_*_guarded``）执行，因此并发闸门、
 RAG 降级、异常分类（``ServiceBusyError`` / ``DetectionError``）语义与旧实现一致。
 
+- 流式生成期间，每累计约 ``output_detect_interval`` 个 token 就对**已生成内容**做一次
+  输出检测（估算见 ``llm_utils.estimate_tokens``），命中不安全立刻中断生成并推送
+  ``output_detection`` 事件；生成结束后仍会做一次整段检测（覆盖不足一个间隔的尾巴）。
 - 同步模式（``stream=False``）：``DefenseAgent.run`` 用 ``graph.invoke`` 一次跑完；
 - 流式模式（``stream=True``）：``DefenseAgent.stream`` 用
   ``graph.stream(stream_mode=["custom", "values"])`` 逐节点推送事件，节点内部经
@@ -25,6 +28,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Protocol, Tuple
 from langchain_core.runnables import RunnableConfig
 
 from ..errors import DetectionError, ServiceBusyError
+from ..llm_utils import estimate_tokens
 from .state import CANCELLED_STOP, PipelineState
 
 logger = logging.getLogger(__name__)
@@ -54,13 +58,38 @@ def _emit(state: PipelineState, event: str, data: Any) -> None:
         return
     from langgraph.config import get_stream_writer
 
-    get_stream_writer()({"event": event, "data": data})
+    try:
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 - 不在状态图运行时（例如直接调用节点做单测）没有事件通道
+        logger.debug("[流式] 无 stream writer，跳过事件 %s", event)
+        return
+    writer({"event": event, "data": data})
 
 
 def _cancel_event(config: Optional[Dict[str, Any]]):
     """取出编排层注入的取消信号（客户端断流置位）。"""
     configurable = (config or {}).get("configurable") or {}
     return configurable.get("cancel_event")
+
+
+def _detection_payload(result: Any) -> Dict[str, Any]:
+    """把输出检测结果整理成状态 / SSE 事件里统一的字典。"""
+    return {
+        "is_safe": result.is_safe,
+        "failed_rules": result.failed_rules,
+        "total_rules": result.total_rules,
+    }
+
+
+def _skips_output_detection(state: PipelineState) -> bool:
+    """输入高置信是否跳过输出检测（收尾策略与流式增量检测共用同一判断）。
+
+    两者必须一致：既然按策略跳过了收尾检测，就不该在流式过程中额外发起增量检测。
+    """
+    if not state.get("skip_output_when_high_confidence"):
+        return False
+    input_detection = state.get("input_detection") or {}
+    return input_detection.get("p_safe", 0.0) >= state.get("safe_skip_threshold", 1.0)
 
 
 # ── 节点 ────────────────────────────────────────────────────────────
@@ -144,7 +173,11 @@ def generation_node(
             raise DetectionError(f"聊天生成失败: {exc}") from exc
 
     cancel_event = _cancel_event(config)
-    chunks: list[str] = []
+    interval = int(state.get("output_detect_interval") or 0)
+    incremental = interval > 0 and not _skips_output_detection(state)
+    text = ""
+    tokens_since_check = 0
+    checked_tokens = 0
     upstream = steps._run_chat_stream_guarded(prompt, max_tokens=max_tokens, temperature=temperature)
     try:
         for delta in upstream:
@@ -152,12 +185,53 @@ def generation_node(
                 # 客户端已断流：就地结束状态图，避免继续输出检测
                 logger.info("[流式] 客户端断开，提前终止聊天生成")
                 return {
-                    "model_response": "".join(chunks),
+                    "model_response": text,
                     "is_safe": False,
                     "stopped_at": CANCELLED_STOP,
                 }
-            chunks.append(delta)
+            text += delta
             _emit(state, "delta", {"content": delta})
+
+            if not incremental:
+                continue
+
+            # ── 增量输出检测：每累计约 interval 个 token 检查一次已生成内容 ──
+            tokens_since_check += estimate_tokens(delta)
+            if tokens_since_check < interval:
+                continue
+            # 扣掉一个间隔、保留余数，避免每次检测都丢弃不足一个间隔的 token
+            tokens_since_check -= interval
+            checked_tokens += interval
+            try:
+                result = steps._run_output_detection_guarded(
+                    text=state["user_input"],
+                    answer=text,
+                    constitution_file=state.get("constitution_file"),
+                    api_key=state.get("detector_api_key"),
+                    base_url=state.get("detector_api_url"),
+                    model_name=state.get("detector_model_name"),
+                )
+            except ServiceBusyError:
+                logger.warning("[503] output_detection busy（增量检测）")
+                raise
+            except Exception as exc:  # noqa: BLE001 - 与收尾检测一致：检测失败默认放行
+                logger.warning("[流式] 增量输出检测失败（继续生成）: %s", exc)
+                continue
+
+            if not result.is_safe:
+                detection = _detection_payload(result)
+                _emit(state, "output_detection", detection)
+                logger.warning(
+                    "[输出拦截] 流式增量检测命中，提前中断生成（约 %d token 处，命中类别: %s）",
+                    checked_tokens,
+                    ", ".join(result.failed_rules) or "未给出",
+                )
+                return {
+                    "model_response": text,
+                    "output_detection": detection,
+                    "is_safe": False,
+                    "stopped_at": "output_detection",
+                }
     except ServiceBusyError:
         logger.warning("[503] chat busy")
         raise
@@ -169,17 +243,17 @@ def generation_node(
         if close is not None:
             close()
 
-    return {"model_response": "".join(chunks)}
+    return {"model_response": text}
 
 
 def skip_policy_node(
     state: PipelineState, steps: Optional[PipelineSteps] = None, config: Optional[Dict[str, Any]] = None
 ) -> PipelineState:
     """阶段 4：输入高置信时跳过输出检测（仍保留生成的回复）。"""
-    if not state.get("skip_output_when_high_confidence"):
+    if state.get("stopped_at"):
+        # 上游已终止（如流式增量检测命中）：不要覆盖终止原因
         return {}
-    input_detection = state.get("input_detection") or {}
-    if input_detection.get("p_safe", 0.0) >= state.get("safe_skip_threshold", 1.0):
+    if _skips_output_detection(state):
         return {"is_safe": True, "stopped_at": "output_skipped"}
     return {}
 
@@ -203,11 +277,7 @@ def output_detection_node(
     except Exception as exc:  # noqa: BLE001
         raise DetectionError(f"输出检测失败: {exc}") from exc
 
-    detection = {
-        "is_safe": result.is_safe,
-        "failed_rules": result.failed_rules,
-        "total_rules": result.total_rules,
-    }
+    detection = _detection_payload(result)
     _emit(state, "output_detection", detection)
 
     if not result.is_safe:

@@ -12,6 +12,7 @@ from injection_guard.agent.pipeline import (
     input_detection_node,
     route_after_input,
     route_after_policy,
+    skip_policy_node,
 )
 from injection_guard.errors import DetectionError
 
@@ -136,3 +137,57 @@ def test_agent_stream_cancel_skips_output_detection():
             cancel.set()
     assert "output_detection" not in emitted
     assert steps.output_calls == []
+
+
+def test_stream_generation_stops_at_interval_when_output_unsafe():
+    """流式增量检测命中：立即中断生成，不再产出后续 delta。"""
+
+    class _UnsafeOutput(_Steps):
+        def _run_output_detection_guarded(self, **kw):
+            self.output_calls.append(kw)
+            return SimpleNamespace(is_safe=False, failed_rules=["S5"], total_rules=12)
+
+    steps = _UnsafeOutput(chunks=("安" * 600, "全" * 600))
+    state = _base_state(stream=True, output_detect_interval=512)
+    out = generation_node(state, steps)
+
+    assert out["stopped_at"] == "output_detection"
+    assert out["is_safe"] is False
+    assert out["model_response"] == "安" * 600      # 第二段没有生成
+    assert len(steps.output_calls) == 1
+    assert steps.output_calls[0]["answer"] == "安" * 600
+
+
+def test_stream_generation_checks_each_interval_and_keeps_going():
+    """增量检测判安全：继续生成，收尾由 output_detection 节点再做一次整段检测。"""
+    steps = _Steps(chunks=("安" * 600, "安" * 600))
+    out = generation_node(_base_state(stream=True, output_detect_interval=512), steps)
+
+    assert out["model_response"] == "安" * 1200
+    assert "stopped_at" not in out
+    assert len(steps.output_calls) == 2
+
+
+def test_stream_generation_skips_incremental_when_input_high_confidence():
+    """输入高置信跳过输出检测时，流式过程中同样不做增量检测。"""
+    steps = _Steps(chunks=("安" * 600, "安" * 600))
+    state = _base_state(
+        stream=True,
+        output_detect_interval=512,
+        skip_output_when_high_confidence=True,
+        input_detection={"is_safe": True, "p_safe": 0.99},
+    )
+    out = generation_node(state, steps)
+
+    assert out["model_response"] == "安" * 1200
+    assert steps.output_calls == []
+
+
+def test_skip_policy_does_not_override_upstream_stop():
+    """上游已终止（增量检测命中）时，跳过策略不得覆盖终止原因。"""
+    state = _base_state(
+        stopped_at="output_detection",
+        skip_output_when_high_confidence=True,
+        input_detection={"is_safe": True, "p_safe": 0.99},
+    )
+    assert skip_policy_node(state) == {}

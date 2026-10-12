@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     # （请求体 safe_skip_threshold / skip_output_when_high_confidence）；不写入 configs/services.env。
     safe_skip_threshold: float = 0.5
     skip_output_when_high_confidence: bool = True
+    # 流式生成期间的「增量输出检测」间隔（token 估算值，见 llm_utils.estimate_tokens）：
+    # 每累计约这么多 token 就对已生成内容检测一次，命中不安全立即中断生成；
+    # 0 = 关闭（只在生成结束后检测一次）。输入高置信跳过输出检测时同样不触发。
+    output_detect_interval_tokens: int = 512
     input_max_concurrency: Optional[int] = None
     output_max_concurrency: Optional[int] = None
     input_acquire_timeout: float = 30.0

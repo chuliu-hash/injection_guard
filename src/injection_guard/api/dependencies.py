@@ -530,6 +530,8 @@ class DefenseService:
             "max_tokens": kwargs.get("max_tokens"),
             "skip_output_when_high_confidence": skip_hc,
             "safe_skip_threshold": skip_threshold,
+            # 流式增量输出检测间隔（token 估算值，0=关闭）；配置项，请求体不覆盖
+            "output_detect_interval": self.settings.output_detect_interval_tokens,
             "stream": stream,
         }
 

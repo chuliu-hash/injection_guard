@@ -96,8 +96,9 @@ async function send(rawText: string): Promise<void> {
           const payload = data as OutputDetection
           record.outputDetection = payload
           record.isSafe = payload.is_safe
-          // 输出不安全：此时流式 token 已全部收到，服务端撤回不了，只能在此
-          // 「检测结果一出来就中断」——立即用拦截文案替换气泡内容。
+          // 输出不安全：服务端已发出的 token 撤回不了，只能在此「检测结果一出来就替换」——
+          // 立即用拦截文案覆盖气泡内容。可能是生成中途的增量检测命中（此时后面的 token
+          // 已被服务端中断），也可能是生成结束后整段检测命中，两种情况的处理相同。
           if (!payload.is_safe) {
             record.stoppedAt = 'output_detection'
             void store.patchMessage(sessionId, assistant.id, { content: OUTPUT_BLOCKED_TEXT })

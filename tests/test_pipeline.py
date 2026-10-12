@@ -16,6 +16,7 @@ def _settings(**over):
         rag_top_k=2,
         skip_output_when_high_confidence=False,
         safe_skip_threshold=0.5,
+        output_detect_interval_tokens=0,
         input_acquire_timeout=1,
         output_acquire_timeout=1,
         chat_acquire_timeout=1,

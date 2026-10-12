@@ -32,6 +32,8 @@ class PipelineState(TypedDict, total=False):
     max_tokens: Optional[int]
     skip_output_when_high_confidence: bool
     safe_skip_threshold: float
+    # 流式增量输出检测间隔（token 估算值；0 = 关闭，只做生成结束后的整段检测）
+    output_detect_interval: int
     # 流式模式：为 True 时节点通过 LangGraph 的 stream writer 推送 SSE 事件
     stream: bool
 
