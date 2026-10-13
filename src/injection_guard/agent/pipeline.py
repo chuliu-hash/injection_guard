@@ -131,24 +131,46 @@ def input_detection_node(
 def rag_retrieval_node(
     state: PipelineState, steps: PipelineSteps, config: Optional[Dict[str, Any]] = None
 ) -> PipelineState:
-    """阶段 2：可选的 RAG 安全上下文增强（失败降级为原始输入）。"""
+    """阶段 2：可选的 RAG 安全上下文增强（失败降级为原始输入）。
+
+    ``rag`` 事件区分三种情况，便于前端与排障：
+
+    - 未启用：``{"enabled": False, "reason": "disabled"}``；
+    - 已启用且成功：``{"enabled": True, "degraded": False, ...}``；
+    - 已启用但降级：``{"enabled": True, "degraded": True, "reason": "error", "error": ...}``
+      （检索异常，已回退为原始输入，不阻断主流程）。
+    """
     rag_info: Optional[Dict[str, Any]] = None
     final_prompt = state["user_input"]
 
-    if state.get("use_rag"):
+    if not state.get("use_rag"):
+        event: Dict[str, Any] = {
+            "enabled": False,
+            "degraded": False,
+            "reason": "disabled",
+            "final_prompt": None,
+            "retrieved_contexts": [],
+        }
+    else:
         try:
             rag_info = steps._run_rag(state["user_input"])
             final_prompt = rag_info["final_prompt"]
+            event = {**rag_info, "degraded": False, "reason": None}
         except Exception as exc:  # noqa: BLE001
             logger.warning("[RAG] 增强失败，降级为原始输入: %s", exc)
-            rag_info = None
+            # 降级也写回状态：非流式响应 / 检测记录里能看出「开了但没生效」而不是「没开」
+            rag_info = {
+                "enabled": True,
+                "degraded": True,
+                "reason": "error",
+                "error": str(exc)[:200],
+                "final_prompt": None,
+                "retrieved_contexts": [],
+            }
+            event = rag_info
             final_prompt = state["user_input"]
 
-    _emit(
-        state,
-        "rag",
-        rag_info or {"enabled": False, "final_prompt": None, "retrieved_contexts": []},
-    )
+    _emit(state, "rag", event)
     return {"rag": rag_info, "final_prompt": final_prompt}
 
 

@@ -12,6 +12,14 @@ const input = computed(() => props.record.inputDetection)
 const rag = computed(() => props.record.rag)
 const output = computed(() => props.record.outputDetection)
 
+/** RAG 标签：区分「未启用」「已启用」「已启用但降级（检索失败）」三种状态。 */
+const ragTag = computed<{ type: 'success' | 'info' | 'warning'; text: string }>(() => {
+  const value = rag.value
+  if (!value || !value.enabled) return { type: 'info', text: '未启用' }
+  if (value.degraded) return { type: 'warning', text: '已启用（降级）' }
+  return { type: 'success', text: '已启用' }
+})
+
 const stoppedLabel = computed(() => {
   switch (props.record.stoppedAt) {
     case 'input_detection':
@@ -70,9 +78,10 @@ const stoppedLabel = computed(() => {
       <h4>RAG 增强</h4>
       <el-descriptions :column="1" size="small" border>
         <el-descriptions-item label="是否启用">
-          <el-tag size="small" :type="rag.enabled ? 'success' : 'info'" effect="light">
-            {{ rag.enabled ? '已启用' : '未启用' }}
-          </el-tag>
+          <el-tag size="small" :type="ragTag.type" effect="light">{{ ragTag.text }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item v-if="rag.degraded" label="降级原因">
+          {{ rag.error || '检索失败，已回退为原始输入' }}
         </el-descriptions-item>
         <el-descriptions-item v-if="rag.retrieved_contexts?.length" label="命中示例">
           {{ rag.retrieved_contexts.length }} 条

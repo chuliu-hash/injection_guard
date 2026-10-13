@@ -141,7 +141,10 @@ def test_rag_failure_degrades_to_original_input():
     )
     outcome = svc.detect(user_input="你好")
     assert svc.chat_prompts == ["你好"]
-    assert outcome.rag is None
+    # 降级与「未启用」区分：enabled=True（请求了）+ degraded=True（检索失败回退）
+    assert outcome.rag["enabled"] is True
+    assert outcome.rag["degraded"] is True
+    assert "embed down" in outcome.rag["error"]
 
 
 def test_rag_disabled_by_default():

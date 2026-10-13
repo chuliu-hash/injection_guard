@@ -107,7 +107,9 @@ def test_generation_node_skips_chat_when_response_provided():
 
 def test_agent_run_degrades_rag_failure():
     outcome = DefenseAgent(_Steps(rag=None)).run(_base_state(use_rag=True))
-    assert outcome["rag"] is None
+    assert outcome["rag"]["enabled"] is True
+    assert outcome["rag"]["degraded"] is True
+    assert outcome["rag"]["reason"] == "error"
     assert outcome["final_prompt"] == "hi"
     assert outcome["is_safe"] is True
 

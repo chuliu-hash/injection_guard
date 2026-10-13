@@ -73,9 +73,16 @@ class RetrievedContext(BaseModel):
 
 
 class RagResult(BaseModel):
-    """RAG 增强结果。``enabled`` 为 True 表示本次请求实际执行了 RAG。"""
+    """RAG 增强结果。
+
+    ``enabled`` 为 True 表示本次请求**请求了** RAG；``degraded`` 为 True 表示请求了但检索失败
+    已降级为原始输入（此时 ``reason="error"``，``error`` 是失败原因）。
+    """
 
     enabled: bool
+    degraded: bool = False
+    reason: Optional[str] = None
+    error: Optional[str] = None
     final_prompt: Optional[str] = None
     retrieved_contexts: List[RetrievedContext] = []
 

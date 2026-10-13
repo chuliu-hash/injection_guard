@@ -125,6 +125,8 @@ def test_rag_disabled_by_default_emits_disabled_event():
     events = _collect(svc, user_input="你好")
     rag_event = next(d for name, d in events if name == "rag")
     assert rag_event["enabled"] is False
+    assert rag_event["degraded"] is False
+    assert rag_event["reason"] == "disabled"
     assert svc.chat_prompts == ["你好"]
 
 
@@ -143,7 +145,11 @@ def test_rag_failure_degrades_to_original_input():
     )
     events = _collect(svc, user_input="你好")
     rag_event = next(d for name, d in events if name == "rag")
-    assert rag_event["enabled"] is False
+    # 与「未启用」区分：开了但检索失败
+    assert rag_event["enabled"] is True
+    assert rag_event["degraded"] is True
+    assert rag_event["reason"] == "error"
+    assert "embed down" in rag_event["error"]
     assert svc.chat_prompts == ["你好"]
 
 

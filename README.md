@@ -21,7 +21,7 @@
 
 - **后端**：Python 3.10 + FastAPI，JWT 登录鉴权（访问令牌 + HttpOnly 刷新 Cookie），SQLAlchemy 会话持久化（默认 SQLite，可切 PostgreSQL）。
 - **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」；流式生成每约 512 token 增量检测一次、命中即中断，事件经状态图逐节点推送（SSE）。
-- **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库、Retriever 检索安全示例，检索失败自动降级为原始输入。
+- **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库、Retriever 检索安全示例；检索失败自动降级为原始输入，检测记录里区分「未启用」与「降级（附失败原因）」。
 - **模型调用**：聊天生成、输入/输出检测的 LLM 调用统一走 LangChain `ChatOpenAI` + `ChatPromptTemplate`（本地服务或云端接口均可，OpenAI 兼容）。
 - **推理服务**：本地自研的 OpenAI 兼容 LLM / Embedding 推理服务（FastAPI + transformers）。
 - **前端**：Vue 3 + Vite + TypeScript。

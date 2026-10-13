@@ -28,6 +28,10 @@ export interface RetrievedContext {
 
 export interface RagResult {
   enabled: boolean
+  /** 请求了 RAG 但检索失败、已降级为原始输入（reason='error'，error 为原因） */
+  degraded?: boolean
+  reason?: 'disabled' | 'error' | null
+  error?: string | null
   final_prompt?: string | null
   retrieved_contexts: RetrievedContext[]
 }
