@@ -183,3 +183,47 @@ def test_dry_run_does_not_start(monkeypatch: pytest.MonkeyPatch, capsys: pytest.
     assert calls == []
     out = capsys.readouterr().out
     assert "派生环境变量" in out and "启动命令" in out
+
+
+def test_per_service_gpu_ids_fall_back_to_global() -> None:
+    """按服务钉卡优先；未设置的取全局 GPU_IDS；都没有则 None（全部可见 GPU）。"""
+    ds = DeploySettings(_env_file=None).model_copy(
+        update={"gpu_ids": "0,1", "output_gpu_ids": "2", "bert_gpu_ids": "3"}
+    )
+    assert ds.gpu_ids_for("input") == "0,1"
+    assert ds.gpu_ids_for("output") == "2"
+    assert ds.gpu_ids_for("embed") == "0,1"
+    assert ds.gpu_ids_for("chat") == "0,1"
+
+    bare = DeploySettings(_env_file=None)
+    assert bare.gpu_ids_for("input") is None
+
+
+def test_build_commands_uses_per_service_gpu_ids() -> None:
+    """每个子服务用自己的 GPU 列表，而不是共用一个全局值。"""
+    ds = DeploySettings(_env_file=None).model_copy(
+        update={"input_gpu_ids": "1", "output_gpu_ids": "2", "embed_gpu_ids": "3"}
+    )
+    by_name = dict(deploy.build_commands(ds, ["input", "output", "embed"], "localhost"))
+
+    def gpu_of(service: str) -> str:
+        argv = by_name[service]
+        return argv[argv.index("--gpu-ids") + 1]
+
+    assert gpu_of("input") == "1"
+    assert gpu_of("output") == "2"
+    assert gpu_of("embed") == "3"
+
+
+def test_derive_child_env_injects_bert_gpu_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BERT 池用卡经 INPUT_DETECTOR_GPU_IDS 注入（防御服务读取）。"""
+    monkeypatch.delenv("INPUT_DETECTOR_GPU_IDS", raising=False)
+    ds = DeploySettings(_env_file=None).model_copy(update={"bert_gpu_ids": "3"})
+    env = deploy.derive_child_env(ds, ["defense", "input"])
+    assert env["INPUT_DETECTOR_GPU_IDS"] == "3"
+
+    # 未配置 / 未部署 defense 时不注入
+    assert "INPUT_DETECTOR_GPU_IDS" not in deploy.derive_child_env(
+        DeploySettings(_env_file=None), ["defense"]
+    )
+    assert "INPUT_DETECTOR_GPU_IDS" not in deploy.derive_child_env(ds, ["input"])

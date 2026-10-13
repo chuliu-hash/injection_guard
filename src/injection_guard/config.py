@@ -312,7 +312,27 @@ class DeploySettings(BaseSettings):
     workers: int = 1
     mode: str = "full"
     request_timeout: int = 300
+    # 全局可用 GPU 列表（input/output/chat/embed 共用的回退值）
     gpu_ids: Optional[str] = None
+    # 按服务钉卡（留空则回退到 gpu_ids，再回退到全部可见 GPU）。
+    # 单个全局 GPU_IDS 会让所有子服务都挑到同一张卡，24G 卡上必然 CUDA OOM。
+    input_gpu_ids: Optional[str] = None
+    output_gpu_ids: Optional[str] = None
+    chat_gpu_ids: Optional[str] = None
+    embed_gpu_ids: Optional[str] = None
+    # 输入检测 BERT 分类器池用卡（deploy 注入子进程的 INPUT_DETECTOR_GPU_IDS；
+    # 留空则由服务按空闲显存自动选卡）
+    bert_gpu_ids: Optional[str] = None
+
+    def gpu_ids_for(self, service: str) -> Optional[str]:
+        """返回某服务应使用的 GPU 列表：按服务配置 > 全局 GPU_IDS > None（全部可见 GPU）。"""
+        per_service = {
+            "input": self.input_gpu_ids,
+            "output": self.output_gpu_ids,
+            "chat": self.chat_gpu_ids,
+            "embed": self.embed_gpu_ids,
+        }.get(service)
+        return per_service or self.gpu_ids
 
     # 是否本地部署 Embedding（否则用 .env 里配置的 EMBED_API_URL，或 RAG 关闭时无需）
     deploy_local_embed: bool = True

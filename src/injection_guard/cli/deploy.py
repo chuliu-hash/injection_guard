@@ -87,7 +87,8 @@ def derive_child_env(ds: DeploySettings, services: list[str]) -> dict[str, str]:
     - 始终导出 ``APP_PORT`` 与输入/输出检测的 ``*_API_URL``。
     - ``EMBED_API_URL`` / ``CHAT_API_URL`` 仅当实际部署对应服务时覆盖，
       避免盖掉 .env 里配置的外部 Embedding / 云端聊天连接。
-    - ``gpu_ids`` 经各子服务的 ``--gpu-ids`` 传递，不在此注入。
+    - ``gpu_ids`` 经各子服务的 ``--gpu-ids`` 传递，不在此注入；但 BERT 分类器池用卡
+      （``bert_gpu_ids``，独立于 LLM 服务）只能靠环境变量，故注入 ``INPUT_DETECTOR_GPU_IDS``。
     """
     env = dict(os.environ)
     host = ds.url_host
@@ -98,6 +99,9 @@ def derive_child_env(ds: DeploySettings, services: list[str]) -> dict[str, str]:
         env["EMBED_API_URL"] = f"http://{host}:{ds.embed_port}/v1"
     if "chat" in services:
         env["CHAT_API_URL"] = f"http://{host}:{ds.chat_port}/v1"
+    if "defense" in services and ds.bert_gpu_ids:
+        # BERT 分类器池用卡（与上面各 LLM 服务错开），由防御服务读取
+        env["INPUT_DETECTOR_GPU_IDS"] = ds.bert_gpu_ids
     return env
 
 
@@ -120,8 +124,9 @@ def build_commands(ds: DeploySettings, services: list[str], host: str) -> list[t
                 "--request-timeout", str(ds.request_timeout),
                 "--service", service,
             ]
-            if ds.gpu_ids:
-                argv += ["--gpu-ids", ds.gpu_ids]
+            gpu_ids = ds.gpu_ids_for(service)
+            if gpu_ids:
+                argv += ["--gpu-ids", gpu_ids]
             commands.append((service, argv))
         elif service == "embed":
             argv = [
@@ -131,8 +136,9 @@ def build_commands(ds: DeploySettings, services: list[str], host: str) -> list[t
                 "--port", str(ds.embed_port),
                 "--request-timeout", str(ds.request_timeout),
             ]
-            if ds.gpu_ids:
-                argv += ["--gpu-ids", ds.gpu_ids]
+            gpu_ids = ds.gpu_ids_for("embed")
+            if gpu_ids:
+                argv += ["--gpu-ids", gpu_ids]
             commands.append(("embed", argv))
     return commands
 
@@ -145,6 +151,7 @@ def _print_dry_run(child_env: dict[str, str], commands: list[tuple[str, list[str
         "OUTPUT_DETECTOR_API_URL",
         "EMBED_API_URL",
         "CHAT_API_URL",
+        "INPUT_DETECTOR_GPU_IDS",
     ):
         if key in child_env:
             print(f"  {key}={child_env[key]}")
