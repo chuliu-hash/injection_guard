@@ -124,3 +124,24 @@ def test_server_disabled_bert_cannot_be_forced_by_request() -> None:
     assert results[-1]["final_decision_by"] == "llm_fallback"
     assert results[-1]["prediction"] == 0
     assert len(model.calls) == 1
+
+
+def test_empty_bert_group_forces_llm_review_instead_of_safe() -> None:
+    """BERT 组被要求使用却无可用模型（加载失败 / OOM）时，不得凭 0.0 概率判安全。"""
+    detector, model = _vote_detector(use_bert=True, reply="safe")
+
+    results = detector.detect_with_bert_group("你好")
+
+    assert results[-1]["final_decision_by"] == "llm_fallback"
+    assert len(model.calls) == 1
+
+
+def test_empty_bert_group_without_llm_fallback_reports_error() -> None:
+    """既无 BERT 又关掉了 LLM 复审：上报 error，由上层按「检测链路异常」失败关闭。"""
+    detector, _ = _vote_detector(use_bert=True, reply="safe")
+    detector.enable_llm_fallback = False
+
+    results = detector.detect_with_bert_group("你好")
+
+    assert results[0]["model_name"] == "bert_group"
+    assert "error" in results[0]

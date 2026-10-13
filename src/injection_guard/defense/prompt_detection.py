@@ -314,6 +314,20 @@ class Detector:
         # 2. 投票与初步决策
         prob_list = [r["p_attack"] for r in results if "p_attack" in r]
 
+        # BERT 组被要求使用却没有任何模型产出概率（模型加载失败 / 显存不足等）：此时的
+        # 0.0 概率不代表「安全」，不得据此放行，必须交给 LLM 复审。
+        bert_group_unavailable = use_bert_active and not prob_list
+        if bert_group_unavailable:
+            logger.warning("[Detector] BERT 组无可用模型，本次强制 LLM 复审")
+            if not self.enable_llm_fallback:
+                results.append(
+                    {
+                        "model_name": "bert_group",
+                        "error": "BERT 分类器组无可用模型（可能加载失败或显存不足）",
+                        "response_time": 0.0,
+                    }
+                )
+
         if prob_list:
             p_final, confidence_score, diag = confidence_weighted_vote(prob_list)
         else:
@@ -344,7 +358,7 @@ class Detector:
             low_p, high_p = llm_p_range
             needs_llm_review = (
                 confidence_score < llm_conf_threshold or low_p < p_final < high_p
-            ) or not use_bert_active
+            ) or not use_bert_active or bert_group_unavailable
             ensemble_result["decision"] = (
                 "LLM_review"
                 if needs_llm_review

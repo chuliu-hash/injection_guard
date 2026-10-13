@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 from ..config import SENSITIVITY_LEVELS, Settings, get_settings
 from ..errors import DetectionError, ServiceBusyError  # noqa: F401  (再导出，供 api/测试沿用)
-from ..services.gpu import parse_gpu_ids
+from ..services.gpu import free_memory_mb, parse_gpu_ids
 
 if TYPE_CHECKING:  # 仅类型检查时导入，避免把 torch/transformers 带到模块加载
     from ..agent.pipeline import DefenseAgent
@@ -157,9 +157,13 @@ class DefenseService:
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
         device: Optional[str] = None,
+        load_bert: Optional[bool] = None,
     ) -> Detector:
         # BERT 是否加载由服务端配置决定（ENABLE_BERT）；请求级 use_bert 只决定本次是否使用。
-        kwargs: Dict[str, Any] = {"use_bert": self.settings.enable_bert}
+        # ``load_bert`` 仅用于选卡后显式降级（显存不足时本进程不加载 BERT）。
+        kwargs: Dict[str, Any] = {
+            "use_bert": self.settings.enable_bert if load_bert is None else load_bert
+        }
         if llm_api_url is not None:
             kwargs["llm_api_url"] = llm_api_url
         if llm_api_model is not None:
@@ -173,6 +177,40 @@ class DefenseService:
         detector.set_bert()
         detector.set_sensitivity(self.settings.default_sensitivity)
         return detector
+
+    def _select_input_devices(self) -> Tuple[List[Optional[str]], bool]:
+        """为输入检测器池挑卡，返回 ``(devices, load_bert)``。
+
+        未启用 BERT（``ENABLE_BERT=false``）时按原先方式每卡一个轻量实例（只持 HTTP
+        客户端），``load_bert`` 为 ``False``。启用 BERT 时先查空闲显存：低于
+        ``INPUT_DETECTOR_MIN_FREE_MB`` 的卡跳过（这些卡常被其他任务占满，直接加载
+        会 CUDA OOM）；若全部候选卡都不足，则本次不加载 BERT，输入检测退化为 LLM 复审。
+        """
+        if not self.settings.enable_bert:
+            devices = [f"cuda:{gpu_id}" for gpu_id in self.input_gpu_ids]
+            return (devices or [None]), False
+
+        candidates = self.input_gpu_ids
+        if not candidates:
+            # 无可见 GPU：交给 Detector 自行选设备（通常回落到 CPU），不做显存检查
+            return [None], True
+        free_mb = free_memory_mb(candidates)
+        min_free = max(0, self.settings.input_detector_min_free_mb)
+        usable = [gpu_id for gpu_id in candidates if free_mb.get(gpu_id, 0) >= min_free]
+        logger.info(
+            "[预热] BERT 选卡: 候选=%s, 空闲显存(MiB)=%s, 下限=%s, 选用=%s",
+            candidates,
+            free_mb,
+            min_free,
+            usable,
+        )
+        if not usable:
+            logger.warning(
+                "[预热] 候选 GPU 空闲显存均低于 %s MiB，本次不加载 BERT 分类器，输入检测退化为 LLM 复审",
+                min_free,
+            )
+            return [None], False
+        return [f"cuda:{gpu_id}" for gpu_id in usable], True
 
     def _get_input_detector(
         self,
@@ -195,9 +233,7 @@ class DefenseService:
             if self._input_detectors:
                 return next(self._input_cycle)
 
-            devices = (
-                [f"cuda:{gpu_id}" for gpu_id in self.input_gpu_ids] if self.input_gpu_ids else [None]
-            )
+            devices, load_bert = self._select_input_devices()
             detectors: List[Detector] = []
             for device in devices:
                 for _ in range(self.replicas):
@@ -206,6 +242,7 @@ class DefenseService:
                             llm_api_url=llm_api_url,
                             llm_api_model=llm_api_model,
                             device=device,
+                            load_bert=load_bert,
                         )
                     )
 

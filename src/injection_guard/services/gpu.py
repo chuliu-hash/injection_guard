@@ -38,6 +38,30 @@ def parse_gpu_ids(value: Optional[str], device_count: int) -> List[int]:
     return sorted(set(ids)) or list(range(device_count))
 
 
+def free_memory_mb(device_ids: Iterable[int]) -> Dict[int, int]:
+    """查询各 GPU 的当前空闲显存（MiB）；不可用或查询失败时该卡记 0。
+
+    用于在加载模型前避开已被其他任务占满的卡（见 ``DefenseService`` 的 BERT
+    分类器选卡逻辑），避免直接 CUDA OOM。torch 为惰性导入，未安装/无 CUDA 时返回空表。
+    """
+    ids = [int(device_id) for device_id in device_ids]
+    if not ids:
+        return {}
+    try:
+        import torch
+    except Exception:  # noqa: BLE001 - 无 torch 时不做显存检查
+        return {}
+
+    free: Dict[int, int] = {}
+    for device_id in ids:
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device_id)
+            free[device_id] = int(free_bytes // (1024 * 1024))
+        except Exception:  # noqa: BLE001 - 单卡查询失败不阻断其余卡
+            free[device_id] = 0
+    return free
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False

@@ -114,6 +114,8 @@ huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-d
 **BERT 分类器默认不参与检测**：`ENABLE_BERT=false`（默认）时输入检测只走 8094 的 LLM 复审；
 在 `configs/services.env` 或环境变量里设为 `true`，服务才会加载 `models/BERT/` 下**全部**分类器目录做集成投票
 （置信度不足或概率落在模糊区间时再触发 LLM 复审），加载发生在首次检测请求时。
+选卡会跳过空闲显存低于 `INPUT_DETECTOR_MIN_FREE_MB`（默认 4096 MiB）的 GPU，避免与其他任务
+抢显存导致 CUDA OOM；若候选卡都不足则本次不加载 BERT，输入检测退化为 LLM 复审。
 
 ## 环境准备
 

@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     input_acquire_timeout: float = 30.0
     output_acquire_timeout: float = 30.0
     input_detector_gpu_ids: Optional[str] = None
+    # 加载 BERT 分类器前要求的最小空闲显存（MiB，env: INPUT_DETECTOR_MIN_FREE_MB）：
+    # 空闲显存不足的 GPU 会被跳过（避免与其他任务抢显存导致 CUDA OOM）；
+    # 全部候选卡都不足时本次不加载 BERT，输入检测退化为 LLM 复审。0 = 不检查。
+    input_detector_min_free_mb: int = 4096
     input_detector_replicas_per_gpu: int = 1
 
     # 输入检测所调用的本地 LLM（base URL；端点路径由 url_utils.join_endpoint 拼接）
