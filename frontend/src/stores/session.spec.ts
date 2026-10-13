@@ -115,3 +115,33 @@ describe('session store (server-backed)', () => {
     expect(mocked.createSession).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('会话列表并发加载', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it('侧栏与聊天页同时挂载时只发一次列表请求，且不新建空会话', async () => {
+    let resolveList: (value: ChatSession[]) => void = () => {}
+    mocked.listSessions.mockReturnValue(
+      new Promise<ChatSession[]>((resolve) => {
+        resolveList = resolve
+      }),
+    )
+    mocked.getSession.mockResolvedValue(makeSession('a'))
+    const store = useSessionStore()
+
+    const sidebar = store.ensureLoaded()
+    const chat = store.activate()
+    // 模拟真实网络延迟：列表尚未返回时聊天页已经继续执行
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    resolveList([makeSession('a')])
+    const opened = await chat
+    await sidebar
+
+    expect(mocked.listSessions).toHaveBeenCalledTimes(1)
+    expect(mocked.createSession).not.toHaveBeenCalled()
+    expect(opened.id).toBe('a')
+  })
+})

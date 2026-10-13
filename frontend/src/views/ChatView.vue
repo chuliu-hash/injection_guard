@@ -36,9 +36,13 @@ const BLOCKED_TEXT = '该消息未通过安全检测，已被拦截。'
 const OUTPUT_BLOCKED_TEXT = '该回复未通过输出安全检测，已被拦截。'
 
 onMounted(async () => {
-  const param = route.params.sessionId
-  const session = await store.activate(typeof param === 'string' ? param : undefined)
-  if (route.params.sessionId !== session.id) void router.replace(`/chat/${session.id}`)
+  try {
+    const param = route.params.sessionId
+    const session = await store.activate(typeof param === 'string' ? param : undefined)
+    if (route.params.sessionId !== session.id) void router.replace(`/chat/${session.id}`)
+  } catch (error) {
+    ElMessage.error(`加载会话失败：${error instanceof Error ? error.message : String(error)}`)
+  }
 })
 
 watch(

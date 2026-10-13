@@ -18,6 +18,19 @@ interface SessionState {
 const NEW_TITLE = '新会话'
 
 /**
+ * 进行中的列表请求（模块级，不放进 state：它是「进程内共享的 Promise」，不是数据）。
+ *
+ * 侧栏（SessionList）与聊天页（ChatView）在同一次导航里**同时挂载**、各自调用
+ * ``ensureLoaded()``：若第二次调用看到 ``loading`` 就直接返回，``activate()`` 会误判成
+ * 「没有任何会话」而新建一个空会话，用户看到的就是「历史记录不见了、聊天区一片空白」。
+ * 因此并发调用共享同一次请求。
+ */
+let listInflight: Promise<void> | null = null
+
+/** 登录态代次：``reset()``（登出 / 切换账号）后，先前发出的列表结果必须丢弃。 */
+let listGeneration = 0
+
+/**
  * 会话状态：**服务端为权威数据源**（`/api/sessions`，按用户隔离）。
  * 本 store 只做内存缓存与乐观更新；流式增量（appendMessageContent）仅改本地，
  * 结束时再用 patchMessage 落库，避免逐 token 打服务端。
@@ -42,12 +55,20 @@ export const useSessionStore = defineStore('session', {
   },
 
   actions: {
-    /** 拉取会话列表；当前选中项失效时回落到最近一个。 */
+    /** 拉取会话列表；并发调用共享同一次请求（见模块级 ``listInflight``）。 */
     async loadSessions(): Promise<void> {
-      if (this.loading) return
+      if (listInflight) return listInflight
       this.loading = true
+      const generation = listGeneration
+      listInflight = this._fetchSessions(generation)
+      return listInflight
+    },
+
+    /** 实际拉取；当前选中项失效时回落到最近一个。 */
+    async _fetchSessions(generation: number): Promise<void> {
       try {
         const list = await sessionsApi.listSessions()
+        if (generation !== listGeneration) return // 期间已登出 / 切换账号：丢弃过期结果
         this.sessions = list
         this.loaded = true
         if (!this.currentId || !list.some((s) => s.id === this.currentId)) {
@@ -55,6 +76,7 @@ export const useSessionStore = defineStore('session', {
         }
       } finally {
         this.loading = false
+        listInflight = null
       }
     },
 
@@ -140,6 +162,9 @@ export const useSessionStore = defineStore('session', {
       this.loaded = false
       this.loading = false
       this.loadedIds = []
+      // 让仍在途的列表请求作废，避免把上一个账号的会话写回缓存
+      listGeneration += 1
+      listInflight = null
     },
 
     async appendMessage(sessionId: string, role: MessageRole, content = ''): Promise<ChatMessage> {

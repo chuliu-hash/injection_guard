@@ -11,8 +11,13 @@ const store = useSessionStore()
 const route = useRoute()
 const router = useRouter()
 
-onMounted(() => {
-  void store.ensureLoaded()
+onMounted(async () => {
+  try {
+    await store.ensureLoaded()
+  } catch (error) {
+    // 加载失败时明确提示，避免「会话记录凭空消失」的错觉（如登录态失效）
+    ElMessage.error(`加载会话列表失败：${error instanceof Error ? error.message : String(error)}`)
+  }
 })
 
 /** 切到某会话的聊天页。侧栏在任意路由下都挂着（如 /settings），
