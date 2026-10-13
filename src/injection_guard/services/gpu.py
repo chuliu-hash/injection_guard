@@ -1,7 +1,12 @@
 """跨进程 GPU 分配。
 
 通过 ``tempfile`` 下的 JSON + 自旋文件锁记录「进程 -> GPU」映射，
-按负载均衡挑选 GPU，进程退出时释放。多个服务共用同一命名空间即可协调。
+按负载均衡挑选 GPU，进程退出时释放。
+
+多个服务共用同一命名空间才能互相避让，故默认命名空间统一为
+``injection_guard``（``GPU_ALLOC_NAMESPACE`` 可覆盖；各服务自身的
+``*_GPU_NAMESPACE`` 优先）。互不相知时，LLM 推理服务与 Embedding 服务
+会各自选到同一张卡，进而互相 CUDA OOM。
 """
 
 from __future__ import annotations
@@ -15,6 +20,33 @@ from contextlib import contextmanager
 from typing import Dict, Iterable, Iterator, List, Optional
 
 _ASSIGNED: Dict[tuple, int] = {}
+
+# 默认命名空间：本项目所有子服务共用，便于跨服务避让（见模块 docstring）
+DEFAULT_NAMESPACE = "injection_guard"
+
+
+def resolve_namespace(explicit: Optional[str] = None) -> str:
+    """解析 GPU 分配命名空间：服务自身配置 > ``GPU_ALLOC_NAMESPACE`` > 默认值。"""
+    return explicit or os.environ.get("GPU_ALLOC_NAMESPACE") or DEFAULT_NAMESPACE
+
+
+def gpu_assignment_load(namespace: str) -> Dict[int, int]:
+    """读取命名空间内仍存活的分配：``{gpu_id: 进程数}``。
+
+    供「选卡时避开别的服务正在用的卡」使用（如输入检测的 BERT 分类器池）。
+    """
+    state_path, _lock_path = _state_paths(namespace)
+    with _spin_file_lock(_lock_path):
+        assignments = _load_state(state_path).get("assignments", {})
+        alive = {
+            int(gpu_id): None
+            for pid, gpu_id in assignments.items()
+            if pid.isdigit() and pid_alive(int(pid))
+        }
+    counts: Dict[int, int] = {}
+    for gpu_id in alive:
+        counts[gpu_id] = counts.get(gpu_id, 0) + 1
+    return counts
 
 
 def parse_gpu_ids(value: Optional[str], device_count: int) -> List[int]:

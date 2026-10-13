@@ -30,7 +30,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..config import InferenceSettings, get_inference_settings
-from .gpu import assign_process_gpu, parse_gpu_ids
+from .gpu import assign_process_gpu, parse_gpu_ids, resolve_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +218,7 @@ def _select_worker_device() -> Optional[int]:
     settings = _inference_settings()
     device_count = torch.cuda.device_count()
     gpu_ids = parse_gpu_ids(settings.api_server_gpu_ids, device_count)
-    namespace = settings.api_server_gpu_namespace or f"api_server_{os.getppid()}"
+    namespace = resolve_namespace(settings.api_server_gpu_namespace)
     gpu_id = assign_process_gpu(namespace, device_count, gpu_ids)
     if gpu_id is None:
         return None

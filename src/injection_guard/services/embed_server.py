@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
 from ..config import get_settings
-from .gpu import assign_process_gpu, parse_gpu_ids
+from .gpu import assign_process_gpu, parse_gpu_ids, resolve_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def _select_worker_device() -> str:
     settings = get_settings()
     device_count = torch.cuda.device_count()
     gpu_ids = parse_gpu_ids(settings.embed_gpu_ids, device_count)
-    namespace = settings.embed_gpu_namespace or f"embed_{os.getppid()}"
+    namespace = resolve_namespace(settings.embed_gpu_namespace)
     gpu_id = assign_process_gpu(namespace, device_count, gpu_ids)
     if gpu_id is None:
         return "cpu"

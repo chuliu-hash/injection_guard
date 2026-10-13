@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 from ..config import SENSITIVITY_LEVELS, Settings, get_settings
 from ..errors import DetectionError, ServiceBusyError  # noqa: F401  (再导出，供 api/测试沿用)
-from ..services.gpu import free_memory_mb, parse_gpu_ids
+from ..services.gpu import free_memory_mb, gpu_assignment_load, parse_gpu_ids, resolve_namespace
 
 if TYPE_CHECKING:  # 仅类型检查时导入，避免把 torch/transformers 带到模块加载
     from ..agent.pipeline import DefenseAgent
@@ -216,11 +216,17 @@ class DefenseService:
             return [None], True
         free_mb = free_memory_mb(candidates)
         min_free = max(0, self.settings.input_detector_min_free_mb)
-        usable = [gpu_id for gpu_id in candidates if free_mb.get(gpu_id, 0) >= min_free]
+        # 其他子服务（LLM / Embedding）在当前命名空间里已经占用的卡：优先避开，
+        # 否则会出现「BERT 加载到一半被别的进程抢光显存」→ CUDA OOM。
+        busy = gpu_assignment_load(resolve_namespace())
+        enough = [gpu_id for gpu_id in candidates if free_mb.get(gpu_id, 0) >= min_free]
+        idle_enough = [gpu_id for gpu_id in enough if busy.get(gpu_id, 0) == 0]
+        usable = idle_enough or enough
         logger.info(
-            "[预热] BERT 选卡: 候选=%s, 空闲显存(MiB)=%s, 下限=%s, 选用=%s",
+            "[预热] BERT 选卡: 候选=%s, 空闲显存(MiB)=%s, 其他服务占用=%s, 下限=%s, 选用=%s",
             candidates,
             free_mb,
+            busy,
             min_free,
             usable,
         )
@@ -230,6 +236,10 @@ class DefenseService:
                 min_free,
             )
             return [None], False
+        if not idle_enough:
+            logger.warning(
+                "[预热] 所有足够显存的 GPU 都已被其他服务占用，仍按显存加载 BERT，注意可能相互挤压"
+            )
         return [f"cuda:{gpu_id}" for gpu_id in usable], True
 
     def _get_input_detector(
