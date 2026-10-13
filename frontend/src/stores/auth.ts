@@ -14,6 +14,12 @@ interface AuthState {
   loading: boolean
 }
 
+/**
+ * 进行中的登录态恢复（模块级，不放进 state）：并发导航 / 多处调用 ``ensureReady()``
+ * 时共享同一次恢复，否则第二次调用会在 ``restore()`` 完成前读到空令牌，误判为未登录。
+ */
+let restoreInflight: Promise<boolean> | null = null
+
 export const useAuthStore = defineStore('auth', {
   state: (): AuthState => ({ user: null, accessToken: null, ready: false, loading: false }),
 
@@ -65,11 +71,16 @@ export const useAuthStore = defineStore('auth', {
       }
     },
 
-    /** 应用启动/路由守卫调用：只尝试恢复一次，返回是否已登录。 */
+    /** 应用启动/路由守卫调用：只尝试恢复一次（并发调用共享同一次），返回是否已登录。 */
     async ensureReady(): Promise<boolean> {
       if (this.ready) return this.isAuthenticated
-      this.ready = true
-      return await this.restore()
+      if (!restoreInflight) {
+        restoreInflight = this.restore().finally(() => {
+          this.ready = true
+          restoreInflight = null
+        })
+      }
+      return await restoreInflight
     },
 
     /** http 层 401 时调用：刷新成功返回 true（供重试）。 */

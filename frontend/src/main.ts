@@ -30,4 +30,6 @@ app.use(ElementPlus)
 // http 层 401 时用 refresh Cookie 换新令牌（注册在 pinia 就绪之后）
 registerRefreshHandler(() => useAuthStore().refreshSession())
 
-app.mount('#app')
+// 等首次导航完成再挂载：路由守卫会在其中用 refresh Cookie 恢复登录态（access token 只在内存），
+// 否则应用外壳会在拿到令牌前挂载，首屏的带鉴权请求必然 401（再靠 401 重试补救）。
+void router.isReady().finally(() => app.mount('#app'))

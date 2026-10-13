@@ -80,4 +80,23 @@ describe('auth store', () => {
     expect(store.isAuthenticated).toBe(false)
     expect(getAccessToken()).toBeNull()
   })
+
+  it('并发 ensureReady 只恢复一次，且都拿到已登录结果', async () => {
+    let resolveRefresh: (value: AuthTokenResponse) => void = () => {}
+    mocked.refresh.mockReturnValue(
+      new Promise<AuthTokenResponse>((resolve) => {
+        resolveRefresh = resolve
+      }),
+    )
+    const store = useAuthStore()
+
+    const first = store.ensureReady()
+    const second = store.ensureReady()
+    resolveRefresh(tokenResponse())
+
+    expect(await first).toBe(true)
+    expect(await second).toBe(true)
+    expect(mocked.refresh).toHaveBeenCalledTimes(1)
+    expect(getAccessToken()).toBe('tok-1')
+  })
 })
