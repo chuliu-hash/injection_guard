@@ -10,6 +10,7 @@ import DetectionDrawer from '@/components/DetectionDrawer.vue'
 import MessageList from '@/components/MessageList.vue'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
+import { OUTPUT_BLOCKED_TEXT, resolveFinalPatch } from '@/utils/chatMessage'
 import type {
   DetectionRecord,
   DonePayload,
@@ -31,9 +32,6 @@ let controller: AbortController | null = null
 const session = computed(() => store.current)
 const messages = computed(() => session.value?.messages ?? [])
 const detections = computed(() => session.value?.detections ?? {})
-
-const BLOCKED_TEXT = '该消息未通过安全检测，已被拦截。'
-const OUTPUT_BLOCKED_TEXT = '该回复未通过输出安全检测，已被拦截。'
 
 onMounted(async () => {
   try {
@@ -72,6 +70,13 @@ async function send(rawText: string): Promise<void> {
 
   const record: DetectionRecord = { isSafe: true, stoppedAt: null }
   let streamError: string | null = null
+  // 服务端 done 事件里的完整回复（落库以此为准，流式增量只在本地）
+  let modelResponse: string | null = null
+
+  /** 本地累积的助手正文（流式 delta 只存内存）。 */
+  const localContent = (): string =>
+    store.sessions.find((s) => s.id === sessionId)?.messages.find((m) => m.id === assistant.id)
+      ?.content ?? ''
 
   sending.value = true
   controller = new AbortController()
@@ -111,6 +116,7 @@ async function send(rawText: string): Promise<void> {
           const payload = data as DonePayload
           record.isSafe = payload.is_safe
           record.stoppedAt = payload.stopped_at
+          modelResponse = payload.model_response
         } else if (event === 'error') {
           streamError = (data as { error: string }).error
         }
@@ -118,23 +124,26 @@ async function send(rawText: string): Promise<void> {
       controller.signal,
     )
 
-    const message = store.sessions
-      .find((s) => s.id === sessionId)
-      ?.messages.find((m) => m.id === assistant.id)
-
-    if (streamError) {
-      await store.patchMessage(sessionId, assistant.id, { status: 'error', error: streamError })
-      ElMessage.error(streamError)
-    } else if (record.stoppedAt === 'input_detection' && !message?.content) {
-      await store.patchMessage(sessionId, assistant.id, { content: BLOCKED_TEXT, status: 'done' })
-    } else {
-      await store.patchMessage(sessionId, assistant.id, { status: 'done' })
-    }
+    await store.patchMessage(
+      sessionId,
+      assistant.id,
+      resolveFinalPatch({
+        streamError,
+        stoppedAt: record.stoppedAt,
+        localContent: localContent(),
+        modelResponse,
+      }),
+    )
+    if (streamError) ElMessage.error(streamError)
     await store.attachDetection(sessionId, assistant.id, record)
   } catch (error) {
     const aborted = controller?.signal.aborted === true
     const text2 = aborted ? '已停止生成' : error instanceof Error ? error.message : String(error)
-    await store.patchMessage(sessionId, assistant.id, { status: 'error', error: text2 })
+    await store.patchMessage(sessionId, assistant.id, {
+      content: localContent(),
+      status: 'error',
+      error: text2,
+    })
     await store.attachDetection(sessionId, assistant.id, record)
     if (!aborted) ElMessage.error(text2)
   } finally {
