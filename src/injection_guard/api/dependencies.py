@@ -154,12 +154,12 @@ class DefenseService:
 
     def _build_input_detector(
         self,
-        use_bert: bool = False,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
         device: Optional[str] = None,
     ) -> Detector:
-        kwargs: Dict[str, Any] = {"use_bert": use_bert}
+        # BERT 是否加载由服务端配置决定（ENABLE_BERT）；请求级 use_bert 只决定本次是否使用。
+        kwargs: Dict[str, Any] = {"use_bert": self.settings.enable_bert}
         if llm_api_url is not None:
             kwargs["llm_api_url"] = llm_api_url
         if llm_api_model is not None:
@@ -176,15 +176,18 @@ class DefenseService:
 
     def _get_input_detector(
         self,
-        use_bert: bool = False,
+        use_bert: Optional[bool] = None,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
     ) -> Detector:
         """获取常驻输入 Detector（轮询池）。
 
-        注意：``use_bert`` / ``llm_api_url`` / ``llm_api_model`` 只在首次初始化时
-        生效，后续请求复用同一实例。
+        BERT 模型是否加载取决于 ``Settings.enable_bert``（env ``ENABLE_BERT``），
+        与请求体无关；请求级 ``use_bert`` 只是「本次是否使用已加载的分类器组」。
+        ``llm_api_url`` / ``llm_api_model`` 只在首次初始化时生效，后续请求复用同一实例。
         """
+        if use_bert and not self.settings.enable_bert:
+            logger.warning("[Detector] 请求要求 use_bert=true，但服务端 ENABLE_BERT=false，按未启用处理")
         if self._input_detectors:
             return next(self._input_cycle)
 
@@ -200,7 +203,6 @@ class DefenseService:
                 for _ in range(self.replicas):
                     detectors.append(
                         self._build_input_detector(
-                            use_bert=use_bert,
                             llm_api_url=llm_api_url,
                             llm_api_model=llm_api_model,
                             device=device,
@@ -210,8 +212,9 @@ class DefenseService:
             self._input_detectors = detectors
             self._input_cycle = itertools.cycle(self._input_detectors)
             logger.info(
-                "[预热] 输入检测器池就绪: sensitivity=%s, devices=%s",
+                "[预热] 输入检测器池就绪: sensitivity=%s, BERT=%s, devices=%s",
                 self.settings.default_sensitivity,
+                self.settings.enable_bert,
                 [str(d.device) for d in self._input_detectors],
             )
             return next(self._input_cycle)
@@ -278,7 +281,7 @@ class DefenseService:
     def _run_input_detection(
         self,
         text: str,
-        use_bert: bool = False,
+        use_bert: Optional[bool] = None,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
         sensitivity: Optional[str] = None,
@@ -289,7 +292,7 @@ class DefenseService:
 
         # 敏感度以**局部参数**传入：同一 Detector 实例被并发请求轮询复用时，
         # 阈值只在本次调用内生效，不会串扰其他请求（见 prompt_detection.normalize_sensitivity）。
-        results = detector.detect_with_bert_group(text, sensitivity=sensitivity)
+        results = detector.detect_with_bert_group(text, sensitivity=sensitivity, use_bert=use_bert)
         if not results:
             raise RuntimeError("输入检测器返回空结果")
 
@@ -329,7 +332,7 @@ class DefenseService:
     def _run_input_detection_guarded(
         self,
         text: str,
-        use_bert: bool = False,
+        use_bert: Optional[bool] = None,
         llm_api_url: Optional[str] = None,
         llm_api_model: Optional[str] = None,
         sensitivity: Optional[str] = None,
@@ -519,7 +522,7 @@ class DefenseService:
             # 请求体 > 启动默认值（语义同 RAG 开关）
             "use_rag": self.settings.enable_rag if use_rag is None else use_rag,
             "sensitivity": kwargs.get("sensitivity"),
-            "use_bert": kwargs.get("use_bert", False),
+            "use_bert": kwargs.get("use_bert"),
             "input_llm_api_url": kwargs.get("input_llm_api_url"),
             "input_llm_api_model": kwargs.get("input_llm_api_model"),
             "constitution_file": kwargs.get("constitution_file"),
@@ -542,7 +545,7 @@ class DefenseService:
         model_response: Optional[str] = None,
         use_rag: Optional[bool] = None,
         sensitivity: Optional[str] = None,
-        use_bert: bool = False,
+        use_bert: Optional[bool] = None,
         input_llm_api_url: Optional[str] = None,
         input_llm_api_model: Optional[str] = None,
         constitution_file: Optional[str] = None,
@@ -608,7 +611,7 @@ class DefenseService:
         model_response: Optional[str] = None,
         use_rag: Optional[bool] = None,
         sensitivity: Optional[str] = None,
-        use_bert: bool = False,
+        use_bert: Optional[bool] = None,
         input_llm_api_url: Optional[str] = None,
         input_llm_api_model: Optional[str] = None,
         constitution_file: Optional[str] = None,

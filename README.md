@@ -107,6 +107,14 @@ huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-d
 
 > `models/BERT/` 下另有 `fine_tuned_model`、`fine_tuned_model_base` 两个本地微调子模型，无公开下载地址。
 
+> DeBERTa-V2 系分类器（如 `mdeberta-prompt-injection-detector`）依赖 `sentencepiece` 分词，已随
+> `pip install -e .` 一并安装；若某目录只有 `spm.model` 而无 `tokenizer.json`，加载器会自动回退到慢速
+> SentencePiece 分词器。单个模型加载失败只记 WARNING 并跳过，不影响其余分类器。
+
+**BERT 分类器默认不参与检测**：`ENABLE_BERT=false`（默认）时输入检测只走 8094 的 LLM 复审；
+在 `configs/services.env` 或环境变量里设为 `true`，服务才会加载 `models/BERT/` 下**全部**分类器目录做集成投票
+（置信度不足或概率落在模糊区间时再触发 LLM 复审），加载发生在首次检测请求时。
+
 ## 环境准备
 
 - Python 3.10+（建议用 conda 环境）

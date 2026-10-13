@@ -61,6 +61,47 @@ def normalize_sensitivity(level: Optional[str], fallback: str = "low") -> str:
     return normalized
 
 
+
+# 兜底：部分本地 BERT 目录（如 mdeberta-prompt-injection-detector）只带 SentencePiece
+# 词表（``spm.model``）而无 fast 分词器所需的 ``tokenizer.json``；此时默认的 fast
+# 加载会因离线转换失败而报错，需退回慢速分词器并显式指定词表文件。
+_SENTENCEPIECE_VOCAB_FILES = ("spm.model", "sentencepiece.bpe.model", "tokenizer.model")
+
+
+def _find_sentencepiece_vocab(path: str) -> Optional[str]:
+    """在模型目录内查找 SentencePiece 词表文件，找不到返回 ``None``。"""
+    for name in _SENTENCEPIECE_VOCAB_FILES:
+        candidate = os.path.join(path, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_bert_tokenizer(path: str):
+    """加载本地 BERT 目录的分词器，缺 fast 词表时回退慢速 SentencePiece。
+
+    先按默认（fast）方式加载；失败且目录内存在 SentencePiece 词表时，退回
+    ``use_fast=False`` + 显式 ``vocab_file``（需已安装 ``sentencepiece``）。两条路径
+    都失败则同时保留原始异常链抛出，由调用方决定是否跳过该模型。
+    """
+    try:
+        return AutoTokenizer.from_pretrained(path)
+    except Exception as fast_exc:  # noqa: BLE001 - 需按兜底结果重新抛出
+        vocab_file = _find_sentencepiece_vocab(path)
+        if vocab_file is None:
+            raise
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(path, use_fast=False, vocab_file=vocab_file)
+        except Exception as slow_exc:  # noqa: BLE001 - 保留 fast 与 slow 两条异常链
+            raise fast_exc from slow_exc
+        logger.info(
+            "[Detector] %s 缺 fast 词表，已回退慢速 SentencePiece 分词器（%s）",
+            path,
+            os.path.basename(vocab_file),
+        )
+        return tokenizer
+
+
 @dataclass
 class DetectionResult:
     """结构化的检测结果。"""
@@ -176,7 +217,7 @@ class Detector:
             if not path or not os.path.exists(path):
                 continue
             try:
-                tokenizer = AutoTokenizer.from_pretrained(path)
+                tokenizer = load_bert_tokenizer(path)
                 model = AutoModelForSequenceClassification.from_pretrained(path)
                 model.to(self.device)
                 model.eval()
@@ -199,18 +240,28 @@ class Detector:
         if loaded_count == 0:
             logger.warning("未能成功加载任何 BERT 模型。")
 
-    def detect_with_bert_group(self, text: str, sensitivity: Optional[str] = None) -> List[Dict]:
+    def detect_with_bert_group(
+        self,
+        text: str,
+        sensitivity: Optional[str] = None,
+        use_bert: Optional[bool] = None,
+    ) -> List[Dict]:
         """BERT 组检测 + 可选 LLM 复审。
 
         ``sensitivity`` 为**本次调用**的敏感度档位（``low`` / ``medium`` / ``high``）；
         缺省用本实例的默认档位（``set_sensitivity`` 设定）。阈值仅以局部变量参与
         判定，故并发请求复用同一实例时互不干扰。
+
+        ``use_bert`` 为**本次调用**是否使用已加载的 BERT 分类器组（``None`` = 用实例默认）。
+        模型加载与否由 ``Detector(use_bert=...)``（服务端 ``ENABLE_BERT``）决定：服务端未启用时
+        即便传 ``True`` 也只走 LLM 复审，不会假装安全。
         """
         level = (
             self.sensitivity
             if sensitivity is None
             else normalize_sensitivity(sensitivity, self.sensitivity)
         )
+        use_bert_active = self.use_bert if use_bert is None else bool(use_bert and self.use_bert)
         cfg = SENSITIVITY_CONFIGS[level]
         dec_thresh: float = cfg["dec_thresh"]
         llm_conf_threshold: float = cfg["llm_conf"]
@@ -219,8 +270,10 @@ class Detector:
 
         results: List[Dict] = []
 
-        # 1. BERT 组并行检测
-        for entry in self.models:
+        # 1. BERT 组检测（逐个模型前向；未启用则跳过，直接进入 LLM 复审）
+        if not use_bert_active:
+            logger.debug("[Detector] 本次调用未启用 BERT 组，直接进入 LLM 复审")
+        for entry in self.models if use_bert_active else []:
             start_time = time.time()
             try:
                 encoding = entry["tokenizer"](
@@ -291,7 +344,7 @@ class Detector:
             low_p, high_p = llm_p_range
             needs_llm_review = (
                 confidence_score < llm_conf_threshold or low_p < p_final < high_p
-            ) or not self.use_bert
+            ) or not use_bert_active
             ensemble_result["decision"] = (
                 "LLM_review"
                 if needs_llm_review

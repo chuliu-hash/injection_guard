@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -107,7 +108,11 @@ class SCR_RAG_System:
         logger.info("知识库构建完成，已保存至 %s", self.embed_path)
 
     def load_knowledge_base(self) -> None:
-        """加载编译后的 ``.pt`` 知识库（兼容旧版 list[dict] 格式）。"""
+        """加载编译后的 ``.pt`` 知识库（兼容旧版 list[dict] 格式）。
+
+        缓存里记录了源 JSON 的指纹（``fingerprint``）；与当前 JSON 不一致（或旧版缓存没有
+        指纹）时**重建**，避免改了知识库仍加载陈旧向量；重建失败则回退旧缓存，不阻断启动。
+        """
         if not os.path.exists(self.embed_path):
             self.knowledge_base = []
             self._embedding_matrix = None
@@ -119,8 +124,39 @@ class SCR_RAG_System:
         # 缓存文件由本项目自己写入（含 tensor），故显式关闭 weights_only 限制
         payload = torch.load(self.embed_path, weights_only=False)
         self.knowledge_base, self._embedding_matrix = self._normalize_payload(payload)
+
+        current = self.source_fingerprint()
+        cached = payload.get("fingerprint") if isinstance(payload, dict) else None
+        if current is not None and cached != current:
+            reason = "旧版缓存缺少指纹" if cached is None else "源 JSON 已变更"
+            logger.warning("[RAG] %s，改由 %s 重建向量库 ...", reason, self.db_path)
+            self._rebuild_from_source()
+            return
+
         self._build_index()
         logger.info("成功加载！当前防御库容量: %d 条安全上下文。", len(self.knowledge_base))
+
+    def source_fingerprint(self) -> Optional[str]:
+        """源知识库 JSON 的内容指纹（sha256）；源文件不存在时返回 None。"""
+        if not os.path.exists(self.db_path):
+            return None
+        try:
+            with open(self.db_path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+        except OSError as exc:
+            logger.warning("[RAG] 计算 %s 指纹失败: %s", self.db_path, exc)
+            return None
+
+    def _rebuild_from_source(self) -> None:
+        """缓存过期时按源 JSON 重建；重建失败则回退到已加载的旧缓存。"""
+        cached_kb, cached_matrix = self.knowledge_base, self._embedding_matrix
+        try:
+            self.build_vector_db_from_json()
+        except Exception as exc:  # noqa: BLE001 - 重建失败不应阻断启动
+            logger.error("[RAG] 重建向量库失败（%s），回退使用旧缓存。", exc)
+            self.knowledge_base, self._embedding_matrix = cached_kb, cached_matrix
+        if self._store is None:
+            self._build_index()
 
     @staticmethod
     def _normalize_payload(payload: object) -> Tuple[List[Dict], Optional[torch.Tensor]]:
@@ -172,6 +208,8 @@ class SCR_RAG_System:
             "prompts": [item["prompt"] for item in self.knowledge_base],
             "responses": [item["response"] for item in self.knowledge_base],
             "vectors": self._embedding_matrix,
+            # 记录源 JSON 指纹：文件变化后下次启动自动重建
+            "fingerprint": self.source_fingerprint(),
         }
         parent = os.path.dirname(os.path.abspath(self.embed_path))
         os.makedirs(parent, exist_ok=True)

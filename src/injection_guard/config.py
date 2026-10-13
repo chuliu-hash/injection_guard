@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     # 输入检测敏感度（low / medium / high）：**默认值**——请求体 sensitivity 可逐次覆盖
     # （前端设置面板提供）；可在 configs/services.env 用 DEFAULT_SENSITIVITY 调整。
     default_sensitivity: str = "low"
+    # 是否加载并启用 BERT 分类器组参与输入检测（env: ENABLE_BERT）。
+    # false（默认）= 只走 LLM 复审；true = 加载 models/BERT 下所有分类器做集成投票，
+    # 置信度不足或概率落在模糊区间时再触发 LLM 复审。
+    enable_bert: bool = False
     # 「请求时」策略：**默认值**——随请求由前端设置面板覆盖
     # （请求体 safe_skip_threshold / skip_output_when_high_confidence）；不写入 configs/services.env。
     safe_skip_threshold: float = 0.5

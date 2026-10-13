@@ -18,7 +18,10 @@ class DefendRequest(BaseModel):
     user_input: Optional[str] = None
     model_response: Optional[str] = None
 
-    use_bert: Optional[bool] = False
+    # BERT 分类器组开关（None 时取全局 ENABLE_BERT）。
+    # 模型是否加载由服务端 ENABLE_BERT 决定；请求体只能在服务端已启用时逐次关闭（false），
+    # 要求 true 而服务端未启用会被忽略并记 warning。
+    use_bert: Optional[bool] = None
 
     # RAG 增强开关（None 时取全局 ENABLE_RAG）
     use_rag: Optional[bool] = None

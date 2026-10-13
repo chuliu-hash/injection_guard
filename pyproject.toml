@@ -43,6 +43,9 @@ dependencies = [
     "transformers==4.55.2",
     "accelerate==1.10.0",
     "sentence-transformers==5.7.0",
+    # 部分本地 BERT 目录（DeBERTa-V2）只带 spm.model、无 tokenizer.json，
+    # 需 SentencePiece 走慢速分词器兜底（见 defense/prompt_detection.load_bert_tokenizer）。
+    "sentencepiece>=0.2.0",
     "peft",
     # GPTQ 加载（transformers GptqHfQuantizer 要求 optimum + gptqmodel）
     "optimum==1.27.0",

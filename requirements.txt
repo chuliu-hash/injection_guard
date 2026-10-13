@@ -39,6 +39,8 @@ torch==2.5.1
 transformers==4.55.2
 accelerate==1.10.0
 sentence-transformers==5.7.0
+# SentencePiece 分词（DeBERTa-V2 等仅带 spm.model、缺 tokenizer.json 的本地模型需要）
+sentencepiece>=0.2.0
 peft
 
 # GPTQ 量化模型加载：transformers 走 GptqHfQuantizer，需要 optimum + gptqmodel

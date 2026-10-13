@@ -110,6 +110,58 @@ def test_add_new_attack_context_persists(tmp_path):
     assert reloaded.knowledge_base[-1]["response"] == "拒绝"
 
 
+def test_cache_invalidated_when_source_json_changes(tmp_path):
+    """源 JSON 变了：缓存指纹不匹配 → 自动重建（不再静默用旧向量）。"""
+    db = tmp_path / "kb.json"
+    cache = tmp_path / "kb.pt"
+    _write_kb(db, [{"prompt": "abc", "safe_response": "safe"}])
+    SCR_RAG_System(db_path=str(db), embed_path=str(cache), embeddings=_FakeEmbeddings())
+
+    _write_kb(
+        db,
+        [
+            {"prompt": "abc", "safe_response": "safe"},
+            {"prompt": "xyz", "safe_response": "nope"},
+        ],
+    )
+    embeddings = _FakeEmbeddings()
+    rag = SCR_RAG_System(db_path=str(db), embed_path=str(cache), embeddings=embeddings)
+
+    assert len(rag.knowledge_base) == 2
+    assert embeddings.batch_calls  # 走了 embedding 重建，而不是直接读缓存
+
+
+def test_legacy_cache_without_fingerprint_is_rebuilt_from_json(tmp_path):
+    """旧版缓存没有指纹：以源 JSON 为准重建。"""
+    db = tmp_path / "kb.json"
+    cache = tmp_path / "kb.pt"
+    _write_kb(db, [{"prompt": "abc", "safe_response": "safe"}])
+    torch.save(
+        [{"prompt": "stale", "response": "old", "vector": torch.tensor([1.0, 0.0, 0.0])}],
+        cache,
+    )
+
+    rag = SCR_RAG_System(db_path=str(db), embed_path=str(cache), embeddings=_FakeEmbeddings())
+    assert [item["prompt"] for item in rag.knowledge_base] == ["abc"]
+
+
+def test_rebuild_failure_falls_back_to_loaded_cache(tmp_path):
+    """重建时 embedding 服务不可用：回退旧缓存，不阻断启动。"""
+    db = tmp_path / "kb.json"
+    cache = tmp_path / "kb.pt"
+    _write_kb(db, [{"prompt": "abc", "safe_response": "safe"}])
+    SCR_RAG_System(db_path=str(db), embed_path=str(cache), embeddings=_FakeEmbeddings())
+    _write_kb(db, [{"prompt": "changed", "safe_response": "new"}])
+
+    class _Boom(_FakeEmbeddings):
+        def embed_documents(self, texts):
+            raise RuntimeError("embedding 服务不可达")
+
+    rag = SCR_RAG_System(db_path=str(db), embed_path=str(cache), embeddings=_Boom())
+    assert [item["prompt"] for item in rag.knowledge_base] == ["abc"]
+    assert rag.retrieve("abc", top_k=1) == [{"prompt": "abc", "response": "safe"}]
+
+
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
