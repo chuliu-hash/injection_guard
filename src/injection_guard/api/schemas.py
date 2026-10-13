@@ -39,6 +39,11 @@ class DefendRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 
+    # 会话落库定位（可选）：流式生成结束时由**服务端**把助手消息正文写回会话，
+    # 从而「生成完成后刷新页面 / 换设备」也能看到回复；两个字段都缺省时跳过。
+    session_id: Optional[str] = None
+    assistant_message_id: Optional[str] = None
+
     # 输入检测器配置（仅首次初始化生效）
     input_llm_api_url: Optional[str] = None
     input_llm_api_model: Optional[str] = None

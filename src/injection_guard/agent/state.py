@@ -12,6 +12,27 @@ from typing import Any, Dict, Optional, TypedDict
 # 不会出现在 SSE ``done`` 事件里（此时已无人消费）。
 CANCELLED_STOP = "cancelled"
 
+# 被拦截时写入会话的助手消息正文。需与前端 `frontend/src/utils/chatMessage.ts` 的
+# BLOCKED_TEXT / OUTPUT_BLOCKED_TEXT 保持一致（前端流式期间本地展示同一文案）。
+INPUT_BLOCKED_TEXT = "该消息未通过安全检测，已被拦截。"
+OUTPUT_BLOCKED_TEXT = "该回复未通过输出安全检测，已被拦截。"
+
+
+def final_assistant_content(
+    *, model_response: Optional[str], stopped_at: Optional[str]
+) -> str:
+    """按流水线终态算出应落库的助手回复正文。
+
+    - 输入检测拦截（未曾生成）：写拦截文案；
+    - 输出检测拦截：不落模型原文，写输出侧拦截文案；
+    - 其余（正常结束 / 跳过输出检测 / 用户中断）：落模型回复原文。
+    """
+    if stopped_at == "input_detection":
+        return INPUT_BLOCKED_TEXT
+    if stopped_at == "output_detection":
+        return OUTPUT_BLOCKED_TEXT
+    return model_response or ""
+
 
 class PipelineState(TypedDict, total=False):
     """节点间共享的流水线状态（``total=False``：节点只返回自己产出的增量）。"""

@@ -6,11 +6,15 @@ import asyncio
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ..agent.state import final_assistant_content
+from ..persistence.database import get_database
+from ..persistence.repository import SessionRepository
 from .dependencies import (
     DefenseService,
     DetectionError,
@@ -19,7 +23,7 @@ from .dependencies import (
     validate_defend_request,
 )
 from .schemas import DefendRequest, DefendResponse, TestServicesRequest, TestServicesResponse
-from .security import require_user
+from .security import get_current_user_id, require_user
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +175,42 @@ def _sse_frame(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _sse_event_stream(service: DefenseService, kwargs: Dict[str, Any]):
+@dataclass(frozen=True)
+class _AssistantPersistTarget:
+    """流式生成结束后要落库的助手消息定位（请求体同时带会话与消息 id 时才有）。"""
+
+    user_id: str
+    session_id: str
+    message_id: str
+
+    def persist(self, state: Dict[str, Any]) -> None:
+        """把终态正文写回会话；失败只告警，不影响已经完成的流。
+
+        前端也会 PATCH 一次同样的内容（幂等）：以服务端落库为准，保证客户端收到
+        ``done`` 后立刻刷新 / 换设备也能看到回复正文。
+        """
+        content = final_assistant_content(
+            model_response=state.get("model_response"), stopped_at=state.get("stopped_at")
+        )
+        try:
+            with get_database().session() as db:
+                SessionRepository(db, user_id=self.user_id).patch_message(
+                    self.session_id, self.message_id, {"content": content, "status": "done"}
+                )
+        except Exception:  # noqa: BLE001 - 落库失败不影响已完成的生成
+            logger.warning(
+                "[stream] 助手消息落库失败: session=%s message=%s",
+                self.session_id,
+                self.message_id,
+                exc_info=True,
+            )
+
+
+async def _sse_event_stream(
+    service: DefenseService,
+    kwargs: Dict[str, Any],
+    persist_target: Optional[_AssistantPersistTarget] = None,
+):
     """把阻塞的 ``stream_detect`` 生成器桥接成 SSE 事件流。
 
     ``stream_detect`` 在 worker 线程中执行（内部含阻塞式并发闸门），事件经
@@ -191,8 +230,12 @@ async def _sse_event_stream(service: DefenseService, kwargs: Dict[str, Any]):
 
     def _worker() -> None:
         gen = service.stream_detect(**kwargs)
+        done_state: Optional[Dict[str, Any]] = None
         try:
             for event, data in gen:
+                # 先记下 done 再判断断流：生成已完成时即使用户已关掉页面，也要落库
+                if event == "done" and isinstance(data, dict):
+                    done_state = data
                 if cancelled.is_set():
                     break
                 _push((event, data))
@@ -208,6 +251,8 @@ async def _sse_event_stream(service: DefenseService, kwargs: Dict[str, Any]):
                 gen.close()  # 提前 break 时释放并发闸门
             except Exception:  # noqa: BLE001
                 pass
+            if persist_target is not None and done_state is not None:
+                persist_target.persist(done_state)
             _push(sentinel)
 
     thread = threading.Thread(target=_worker, name="defense_stream", daemon=True)
@@ -236,6 +281,7 @@ async def _sse_event_stream(service: DefenseService, kwargs: Dict[str, Any]):
 async def chat_stream(
     payload: Optional[DefendRequest] = None,
     service: DefenseService = Depends(get_defense_service),
+    user_id: str = Depends(get_current_user_id),
 ):
     """以 Server-Sent Events 逐步推送流水线事件。
 
@@ -265,8 +311,17 @@ async def chat_stream(
         "safe_skip_threshold": payload.safe_skip_threshold,
         "skip_output_when_high_confidence": payload.skip_output_when_high_confidence,
     }
+    # 带会话定位时，由服务端在生成结束时落库助手正文（见 _AssistantPersistTarget）
+    persist_target: Optional[_AssistantPersistTarget] = None
+    if payload.session_id and payload.assistant_message_id:
+        persist_target = _AssistantPersistTarget(
+            user_id=user_id,
+            session_id=payload.session_id,
+            message_id=payload.assistant_message_id,
+        )
+
     return StreamingResponse(
-        _sse_event_stream(service, kwargs),
+        _sse_event_stream(service, kwargs, persist_target),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

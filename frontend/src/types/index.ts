@@ -95,6 +95,9 @@ export interface ChatSession {
 
 export interface ChatStreamRequest {
   user_input: string
+  /** 会话落库定位（可选）：带上后由**服务端**在生成结束时写回助手回复正文。 */
+  session_id?: string
+  assistant_message_id?: string
   use_rag?: boolean
   /** 输入检测敏感度（设置面板提供；缺省由后端的 DEFAULT_SENSITIVITY 决定）。 */
   sensitivity?: SensitivityLevel

@@ -4,6 +4,9 @@
  * 流式增量（`delta`）只改本地缓存，落库在结束时统一进行——这里集中决定该写什么，
  * 避免出现「刷新后助手回复空白」：正文必须以服务端 `done` 事件的 `model_response`
  * 为准写入 `content`，历史上这里只写了 `status`，导致回复正文从未落库。
+ *
+ * 服务端已按同一规则在生成结束时落库（见 `api/routes._AssistantPersistTarget`），
+ * 前端这次 PATCH 是幂等兜底：内容一致，服务端落库失败或未带会话定位时仍能存住。
  */
 import type { StoppedAt } from '@/types'
 

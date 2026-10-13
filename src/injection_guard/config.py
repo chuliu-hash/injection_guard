@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     # 空闲显存不足的 GPU 会被跳过（避免与其他任务抢显存导致 CUDA OOM）；
     # 全部候选卡都不足时本次不加载 BERT，输入检测退化为 LLM 复审。0 = 不检查。
     input_detector_min_free_mb: int = 4096
+    # 启动时是否同步预热输入检测器池（env: WARMUP_ON_STARTUP，默认 true）：
+    # true = 服务就绪前先加载 BERT 分类器，首个检测请求无需等待；
+    # false = 沿用惰性加载（首个检测请求时才建池，测试 / 本地调试用）。
+    warmup_on_startup: bool = True
     input_detector_replicas_per_gpu: int = 1
 
     # 输入检测所调用的本地 LLM（base URL；端点路径由 url_utils.join_endpoint 拼接）

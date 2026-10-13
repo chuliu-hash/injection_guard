@@ -85,6 +85,9 @@ async function send(rawText: string): Promise<void> {
     await chatStream(
       {
         user_input: text,
+        // 带上会话定位：生成结束时由服务端落库正文（前端 PATCH 作为幂等兜底）
+        session_id: sessionId,
+        assistant_message_id: assistant.id,
         use_rag: settings.useRag,
         sensitivity: settings.sensitivity,
         temperature: settings.chatTemperature,

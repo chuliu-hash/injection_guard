@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
@@ -177,6 +178,25 @@ class DefenseService:
         detector.set_bert()
         detector.set_sensitivity(self.settings.default_sensitivity)
         return detector
+
+    def warmup(self) -> None:
+        """启动时预热：按 ``ENABLE_BERT`` 一次性加载输入检测器池（含 BERT 分类器）。
+
+        池是常驻单例，首次检测请求只会命中已加载的实例；放在启动阶段做，可避免
+        「首个请求要同步等 15s+ 模型加载」甚至被网关按超时掐断。加载失败只告警：
+        服务仍然可用，输入检测退化为 LLM 复审（或首次请求时再试一次）。
+        """
+        started = time.time()
+        try:
+            self._get_input_detector()
+            logger.info(
+                "[预热] 输入检测器池加载完成: BERT=%s, devices=%s, 用时 %.1fs",
+                self.settings.enable_bert,
+                self.input_detector_devices,
+                time.time() - started,
+            )
+        except Exception:  # noqa: BLE001 - 预热失败不应阻断服务启动
+            logger.exception("[预热] 输入检测器池加载失败，将在首次检测请求时重试")
 
     def _select_input_devices(self) -> Tuple[List[Optional[str]], bool]:
         """为输入检测器池挑卡，返回 ``(devices, load_bert)``。

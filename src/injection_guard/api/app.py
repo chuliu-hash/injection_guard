@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -16,6 +18,7 @@ from ..config import get_settings
 from ..logging_config import setup_logging
 from ..persistence.database import get_database
 from .auth_routes import router as auth_router
+from .dependencies import get_defense_service
 from .routes import router
 from .session_routes import router as sessions_router
 
@@ -59,7 +62,17 @@ def create_app() -> FastAPI:
             "JWT_SECRET_KEY 仍为默认值，请在生产环境显式设置（openssl rand -hex 32）"
         )
 
-    app = FastAPI(title="InjectionGuard · LLM Guardrails API", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # 启动时同步预热输入检测器池（含 BERT 分类器）：服务开始接客前模型已就绪，
+        # 避免首个检测请求同步等待加载。放到线程里执行，不阻塞事件循环。
+        if settings.warmup_on_startup:
+            await asyncio.to_thread(get_defense_service().warmup)
+        yield
+
+    app = FastAPI(
+        title="InjectionGuard · LLM Guardrails API", version=__version__, lifespan=lifespan
+    )
 
     @app.exception_handler(RequestValidationError)
     async def _handle_request_validation_error(
