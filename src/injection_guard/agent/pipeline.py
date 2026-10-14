@@ -11,6 +11,9 @@
 ``DefenseService`` 的并发受控方法（``_run_*_guarded``）执行，因此并发闸门、
 RAG 降级、异常分类（``ServiceBusyError`` / ``DetectionError``）语义与旧实现一致。
 
+检测节点挂了 ``RetryPolicy``（见 :func:`_retry_policy`）：只重试 ``DetectionError``，
+``ServiceBusyError`` 保持「快速失败 -> 503」不重试。生成节点不重试（重放会重复生成）。
+
 - 流式生成期间，每累计约 ``output_detect_interval`` 个 token 就对**已生成内容**做一次
   输出检测（估算见 ``llm_utils.estimate_tokens``），命中不安全立刻中断生成并推送
   ``output_detection`` 事件；生成结束后仍会做一次整段检测（覆盖不足一个间隔的尾巴）。
@@ -23,7 +26,7 @@ RAG 降级、异常分类（``ServiceBusyError`` / ``DetectionError``）语义�
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Iterator, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tuple
 
 from langchain_core.runnables import RunnableConfig
 
@@ -44,11 +47,19 @@ class PipelineSteps(Protocol):
     def _run_rag(self, user_input: str) -> Dict[str, Any]: ...
 
     def _run_chat_guarded(
-        self, prompt: str, max_tokens: Optional[int] = None, temperature: Optional[float] = None
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str: ...
 
     def _run_chat_stream_guarded(
-        self, prompt: str, max_tokens: Optional[int] = None, temperature: Optional[float] = None
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]: ...
 
 
@@ -133,10 +144,12 @@ def rag_retrieval_node(
 ) -> PipelineState:
     """阶段 2：可选的 RAG 安全上下文增强（失败降级为原始输入）。
 
-    ``rag`` 事件区分三种情况，便于前端与排障：
+    ``rag`` 事件区分四种情况，便于前端与排障：
 
     - 未启用：``{"enabled": False, "reason": "disabled"}``；
     - 已启用且成功：``{"enabled": True, "degraded": False, ...}``；
+    - 已启用但没命中安全示例：``{"enabled": True, "degraded": False,
+      "reason": "no_match", "final_prompt": None}``（不拼接上下文，直接用原始输入）；
     - 已启用但降级：``{"enabled": True, "degraded": True, "reason": "error", "error": ...}``
       （检索异常，已回退为原始输入，不阻断主流程）。
     """
@@ -155,7 +168,8 @@ def rag_retrieval_node(
         try:
             rag_info = steps._run_rag(state["user_input"])
             final_prompt = rag_info["final_prompt"]
-            event = {**rag_info, "degraded": False, "reason": None}
+            # 保留检索层给出的 reason（如 no_match）；只有真正命中时它才是 None
+            event = {**rag_info, "degraded": False, "reason": rag_info.get("reason")}
         except Exception as exc:  # noqa: BLE001
             logger.warning("[RAG] 增强失败，降级为原始输入: %s", exc)
             # 降级也写回状态：非流式响应 / 检测记录里能看出「开了但没生效」而不是「没开」
@@ -184,10 +198,16 @@ def generation_node(
     prompt = state.get("final_prompt") or state["user_input"]
     max_tokens = state.get("max_tokens")
     temperature = state.get("temperature")
+    # 多轮记忆：历史只影响生成，不参与输入检测（信任边界见 README「多轮记忆」）
+    history = state.get("history") or None
 
     if not state.get("stream"):
         try:
-            return {"model_response": steps._run_chat_guarded(prompt, max_tokens=max_tokens, temperature=temperature)}
+            return {
+                "model_response": steps._run_chat_guarded(
+                    prompt, max_tokens=max_tokens, temperature=temperature, history=history
+                )
+            }
         except ServiceBusyError:
             logger.warning("[503] chat busy")
             raise
@@ -200,7 +220,9 @@ def generation_node(
     text = ""
     tokens_since_check = 0
     checked_tokens = 0
-    upstream = steps._run_chat_stream_guarded(prompt, max_tokens=max_tokens, temperature=temperature)
+    upstream = steps._run_chat_stream_guarded(
+        prompt, max_tokens=max_tokens, temperature=temperature, history=history
+    )
     try:
         for delta in upstream:
             if cancel_event is not None and cancel_event.is_set():
@@ -328,6 +350,27 @@ def route_after_policy(state: PipelineState) -> str:
 # ── 图构建 / Agent 封装 ─────────────────────────────────────────────
 
 
+def _retry_policy(steps: PipelineSteps):
+    """检测节点的重试策略；``None`` 表示不重试。
+
+    - 只重试 ``DetectionError``（下游异常 / 检测链路内部错误，多为瞬时的连接或超时）；
+    - ``ServiceBusyError`` 是「并发名额没抢到，请稍后重试」的快速失败语义（-> 503），
+      重试只会把它放大成重试风暴，故显式排除。
+    """
+    max_attempts = int(getattr(getattr(steps, "settings", None), "detect_node_max_attempts", 2) or 1)
+    if max_attempts <= 1:
+        return None
+
+    from langgraph.types import RetryPolicy
+
+    return RetryPolicy(
+        max_attempts=max_attempts,
+        initial_interval=0.3,
+        backoff_factor=2.0,
+        retry_on=DetectionError,
+    )
+
+
 def build_defense_graph(steps: PipelineSteps):
     """构建并编译 LangGraph 状态图。"""
     from langgraph.graph import END, START, StateGraph
@@ -340,11 +383,12 @@ def build_defense_graph(steps: PipelineSteps):
         return runner
 
     builder = StateGraph(PipelineState)
-    builder.add_node("input_detection", bind(input_detection_node))
+    retry_policy = _retry_policy(steps)
+    builder.add_node("input_detection", bind(input_detection_node), retry_policy=retry_policy)
     builder.add_node("rag_retrieval", bind(rag_retrieval_node))
     builder.add_node("generation", bind(generation_node))
     builder.add_node("skip_policy", bind(skip_policy_node))
-    builder.add_node("output_detection", bind(output_detection_node))
+    builder.add_node("output_detection", bind(output_detection_node), retry_policy=retry_policy)
 
     builder.add_edge(START, "input_detection")
     builder.add_conditional_edges("input_detection", route_after_input, {"stop": END, "rag": "rag_retrieval"})

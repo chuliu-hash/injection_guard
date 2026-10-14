@@ -100,6 +100,45 @@ class SessionRepository:
         return int(result.rowcount or 0)
 
     # ── 消息 ──────────────────────────────────────────────────────────
+    def load_history(
+        self,
+        session_id: str,
+        *,
+        max_turns: int = 0,
+        exclude_trailing_user: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """返回可直接回灌给模型的会话历史（按时间顺序）。
+
+        只取**已完成**（``status == "done"``）且内容非空的 user / assistant 消息：
+        ``streaming`` 状态的助手消息正文还不完整，回灌反而会污染上下文。
+        ``max_turns`` 限定为最近 N 轮（1 轮 = 一问一答，即最多 2N 条；0 = 不限）。
+        ``exclude_trailing_user`` 用于剔除「本次请求的那条用户消息」——它已作为当前
+        输入单独传入，不剔除会被重复计入上下文。
+
+        用户隔离由 ``get_session``（带 ``user_id`` 条件）保证：不是自己的会话返回空列表。
+        """
+        session_row = self.get_session(session_id)
+        if session_row is None:
+            return []
+
+        messages = [
+            {"role": row.role, "content": row.content}
+            for row in session_row.messages
+            if row.role in _VALID_ROLES and row.status == "done" and (row.content or "").strip()
+        ]
+
+        if (
+            exclude_trailing_user is not None
+            and messages
+            and messages[-1]["role"] == "user"
+            and messages[-1]["content"] == exclude_trailing_user
+        ):
+            messages.pop()
+
+        if max_turns > 0:
+            messages = messages[-2 * max_turns :]
+        return messages
+
     def append_message(
         self,
         session_id: str,

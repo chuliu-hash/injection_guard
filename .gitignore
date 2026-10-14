@@ -21,6 +21,8 @@ models/
 *.pt
 *.bin
 *.safetensors
+# RAG 向量索引目录（FAISS save_local 产物，运行时生成/迁移）
+resources/*_index/
 
 # 工具缓存
 .pytest_cache/

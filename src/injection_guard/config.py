@@ -99,9 +99,12 @@ class Settings(BaseSettings):
     bert_model_dir: Path = _REPO_ROOT / "models" / "BERT"
     # RAG 知识库 JSON（每条含 prompt / safe_response），覆盖：RAG_DB_PATH
     rag_db_path: Path = _REPO_ROOT / "resources" / "jailbreak_prompts.json"
-    # 向量库缓存：与 rag_db_path 同目录、同主名（扩展名 .pt），**无需指定**；
-    # 存在则直接加载，不存在则从 rag_db_path 重构。
+    # 旧版向量库缓存（自研 torch .pt，与 rag_db_path 同主名），**无需指定**：
+    # 仅用于一次性迁移到下面的 FAISS 索引目录；存在则迁移，不存在则从 rag_db_path 重构。
     rag_embed_path: Optional[Path] = None
+    # 向量库持久化目录（FAISS 官方 save_local 格式：index.faiss / index.pkl / meta.json），
+    # **无需指定**；留空自动派生为 ``<rag_db_path 同目录>/<主名>_index``。
+    rag_index_dir: Optional[Path] = None
 
     # ── 输入检测 ──────────────────────────────────────────────────────
     # 输入检测敏感度（low / medium / high）：**默认值**——请求体 sensitivity 可逐次覆盖
@@ -119,6 +122,10 @@ class Settings(BaseSettings):
     # 每累计约这么多 token 就对已生成内容检测一次，命中不安全立即中断生成；
     # 0 = 关闭（只在生成结束后检测一次）。输入高置信跳过输出检测时同样不触发。
     output_detect_interval_tokens: int = 512
+    # 检测节点**最多尝试次数**（env: DETECT_NODE_MAX_ATTEMPTS，默认 2 = 失败后重试 1 次，
+    # 1 = 不重试）：仅对检测链路内部异常（DetectionError）重试；并发名额超时
+    # （ServiceBusyError -> 503）是快速失败语义，不参与重试（见 agent/pipeline.py）。
+    detect_node_max_attempts: int = 2
     input_max_concurrency: Optional[int] = None
     output_max_concurrency: Optional[int] = None
     input_acquire_timeout: float = 30.0
@@ -157,6 +164,12 @@ class Settings(BaseSettings):
     chat_temperature: float = 0.7
     chat_max_concurrency: Optional[int] = None
     chat_acquire_timeout: float = 120.0
+    # 多轮记忆：回灌给聊天的历史轮数（1 轮 = 一问一答，即最多 2N 条消息；0 = 关闭，
+    # 退化为单轮）。历史由服务端按会话读取，见 persistence.repository.load_history。
+    chat_history_max_turns: int = 10
+    # 历史消息的 token 预算：超出时按「保留最近消息」裁剪（见 chat_client._build_messages）；
+    # 与 chat_history_max_turns 叠加生效。
+    chat_history_max_tokens: int = 2048
 
     # ── Embedding / RAG ───────────────────────────────────────────────
     embed_api_url: str = "http://localhost:8096/v1"
@@ -165,6 +178,9 @@ class Settings(BaseSettings):
     # RAG 增强：「请求时」开关的**默认值**（前端设置/请求体 use_rag 覆盖）；不写入 configs/services.env
     enable_rag: bool = False
     rag_top_k: int = 2
+    # 检索结果的最大距离（FAISS 默认欧氏距离，越小越相似）：超过该值的命中丢弃；
+    # 0 = 不过滤（默认，保持既有行为）。取值需按 embedding 模型的量纲实测标定。
+    rag_max_distance: float = 0.0
 
     # ── 推理服务（services/embed_server.py）──────────────────────────
     # 注意：LLM 推理服务（services/llm_server.py）的生成参数在 InferenceSettings，
@@ -178,9 +194,11 @@ class Settings(BaseSettings):
         return value.lower()
 
     def model_post_init(self, __context: object) -> None:
-        """补齐派生的路径默认值：向量库缓存与知识库 JSON 同目录、同主名（.pt）。"""
+        """补齐派生的路径默认值：旧缓存（.pt）与 FAISS 索引目录都与知识库 JSON 同目录。"""
         if self.rag_embed_path is None:
             self.rag_embed_path = self.rag_db_path.with_suffix(".pt")
+        if self.rag_index_dir is None:
+            self.rag_index_dir = self.rag_db_path.parent / f"{self.rag_db_path.stem}_index"
 
 
 @lru_cache(maxsize=1)

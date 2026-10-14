@@ -23,6 +23,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from ..config import SENSITIVITY_LEVELS, get_settings
 from ..llm_utils import message_text
+from ..services.llm_metrics import MetricsCallbackHandler
 from .confidence_vote import confidence_weighted_vote
 from .risk_mapping import CATEGORY_NAMES, RISK_LEVEL_MAPPING
 
@@ -162,6 +163,7 @@ class Detector:
             top_p=0.9,
             logprobs=True,
             top_logprobs=1,
+            callbacks=[MetricsCallbackHandler("input_detector")],
         )
 
         # 敏感度基线（启动默认值）；单次调用可经 detect_* 的 sensitivity 参数覆盖

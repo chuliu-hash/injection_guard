@@ -466,15 +466,34 @@ class DefenseService:
     def _run_rag(self, user_input: str) -> Dict[str, Any]:
         """检索相似安全上下文并构建 ``final_prompt``。
 
+        没有命中（含全部被 ``RAG_MAX_DISTANCE`` 阈值过滤掉）时**不拼接上下文**：
+        返回 ``final_prompt=None`` 与 ``reason="no_match"``，生成阶段直接用原始输入，
+        避免把「空示例」塞进系统提示词干扰模型。
+
         失败时抛异常，由 ``detect`` 降级处理（不阻断主流程）。
         """
         rag_system = self._get_rag_system()
-        contexts = rag_system.retrieve(user_input, top_k=self.settings.rag_top_k)
+        contexts = rag_system.retrieve(
+            user_input, top_k=self.settings.rag_top_k, max_distance=self.settings.rag_max_distance
+        )
+        if not contexts:
+            logger.info(
+                "[RAG] 未命中的相似安全示例（top_k=%s, max_distance=%s），跳过上下文增强",
+                self.settings.rag_top_k,
+                self.settings.rag_max_distance,
+            )
+            return {
+                "enabled": True,
+                "final_prompt": None,
+                "reason": "no_match",
+                "retrieved_contexts": [],
+            }
         final_prompt = rag_system.construct_safe_prompt(
             user_query=user_input, pre_retrieved_contexts=contexts
         )
         return {
             "enabled": True,
+            "reason": None,
             "final_prompt": final_prompt,
             # 剔除向量（tensor），只保留可序列化的文本字段
             "retrieved_contexts": [
@@ -488,10 +507,11 @@ class DefenseService:
         prompt: str,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """调用普通聊天接口生成回复（生成参数来自请求，留空用 Settings 默认值）。"""
         return self._get_chat_client().complete(
-            prompt, max_tokens=max_tokens, temperature=temperature
+            prompt, max_tokens=max_tokens, temperature=temperature, history=history
         )
 
     def _run_chat_guarded(
@@ -499,13 +519,16 @@ class DefenseService:
         prompt: str,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """带并发控制的聊天生成；获取名额超时抛 ``ServiceBusyError``。"""
         acquired = self._chat_sem.acquire(timeout=self.settings.chat_acquire_timeout)
         if not acquired:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
-            return self._run_chat(prompt, max_tokens=max_tokens, temperature=temperature)
+            return self._run_chat(
+                prompt, max_tokens=max_tokens, temperature=temperature, history=history
+            )
         finally:
             self._chat_sem.release()
 
@@ -514,10 +537,11 @@ class DefenseService:
         prompt: str,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]:
         """流式调用普通聊天接口，逐段 yield 文本增量。"""
         yield from self._get_chat_client().stream(
-            prompt, max_tokens=max_tokens, temperature=temperature
+            prompt, max_tokens=max_tokens, temperature=temperature, history=history
         )
 
     def _run_chat_stream_guarded(
@@ -525,6 +549,7 @@ class DefenseService:
         prompt: str,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]:
         """带并发控制的流式聊天生成；获取名额超时抛 ``ServiceBusyError``。
 
@@ -535,7 +560,7 @@ class DefenseService:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
             yield from self._run_chat_stream(
-                prompt, max_tokens=max_tokens, temperature=temperature
+                prompt, max_tokens=max_tokens, temperature=temperature, history=history
             )
         finally:
             self._chat_sem.release()
@@ -586,6 +611,8 @@ class DefenseService:
         return {
             "user_input": kwargs["user_input"],
             "model_response": kwargs.get("model_response"),
+            # 多轮记忆：服务端按会话读取的历史消息（routes 层注入），仅用于生成阶段
+            "history": kwargs.get("history") or None,
             # 请求体 > 启动默认值（语义同 RAG 开关）
             "use_rag": self.settings.enable_rag if use_rag is None else use_rag,
             "sensitivity": kwargs.get("sensitivity"),
@@ -610,6 +637,7 @@ class DefenseService:
         *,
         user_input: str,
         model_response: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
         use_rag: Optional[bool] = None,
         sensitivity: Optional[str] = None,
         use_bert: Optional[bool] = None,
@@ -642,6 +670,7 @@ class DefenseService:
             stream=False,
             user_input=user_input,
             model_response=model_response,
+            history=history,
             use_rag=use_rag,
             sensitivity=sensitivity,
             use_bert=use_bert,
@@ -676,6 +705,7 @@ class DefenseService:
         *,
         user_input: str,
         model_response: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
         use_rag: Optional[bool] = None,
         sensitivity: Optional[str] = None,
         use_bert: Optional[bool] = None,
@@ -705,6 +735,7 @@ class DefenseService:
             stream=True,
             user_input=user_input,
             model_response=model_response,
+            history=history,
             use_rag=use_rag,
             sensitivity=sensitivity,
             use_bert=use_bert,

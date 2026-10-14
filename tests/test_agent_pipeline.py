@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from injection_guard.agent.pipeline import (
     DefenseAgent,
     build_defense_graph,
@@ -14,7 +16,7 @@ from injection_guard.agent.pipeline import (
     route_after_policy,
     skip_policy_node,
 )
-from injection_guard.errors import DetectionError
+from injection_guard.errors import DetectionError, ServiceBusyError
 
 
 class _Steps:
@@ -25,6 +27,7 @@ class _Steps:
         self._chunks = list(chunks)
         self._rag = rag
         self._output_safe = output_safe
+        self.chat_calls = []
         self.output_calls = []
 
     def _run_input_detection_guarded(self, **_kw):
@@ -35,11 +38,12 @@ class _Steps:
             raise RuntimeError("embed down")
         return self._rag
 
-    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None):
-        self.output_calls.append({"chat_prompt": prompt})
+    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
+        self.chat_calls.append({"prompt": prompt, "history": history})
         return "".join(self._chunks)
 
-    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None):
+    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
+        self.chat_calls.append({"prompt": prompt, "history": history})
         yield from self._chunks
 
     def _run_output_detection_guarded(self, **kw):
@@ -193,3 +197,41 @@ def test_skip_policy_does_not_override_upstream_stop():
         input_detection={"is_safe": True, "p_safe": 0.99},
     )
     assert skip_policy_node(state) == {}
+
+
+# ── 节点级重试策略（LangGraph RetryPolicy）───────────────────────────
+
+
+class _FlakyInputSteps(_Steps):
+    """输入检测固定失败，用于观察图是否会重试。"""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+        self.input_calls = 0
+
+    def _run_input_detection_guarded(self, **_kw):
+        self.input_calls += 1
+        raise self._exc
+
+
+def test_detection_node_retries_internal_errors():
+    steps = _FlakyInputSteps(DetectionError("输入检测失败: 下游抖动"))
+    agent = DefenseAgent(steps)
+
+    with pytest.raises(DetectionError):
+        agent.run(_base_state())
+
+    # DETECT_NODE_MAX_ATTEMPTS 默认 2：失败后重试一次
+    assert steps.input_calls == 2
+
+
+def test_detection_node_does_not_retry_busy_errors():
+    """ServiceBusyError 是快速失败语义（-> 503），重试只会放大它。"""
+    steps = _FlakyInputSteps(ServiceBusyError("输入检测服务繁忙"))
+    agent = DefenseAgent(steps)
+
+    with pytest.raises(ServiceBusyError):
+        agent.run(_base_state())
+
+    assert steps.input_calls == 1

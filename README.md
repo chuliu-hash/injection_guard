@@ -12,6 +12,7 @@
 
 - 输入、输出**双向检测**，只放行通过检查的内容；
 - 流式回复**每约 512 token 增量检测一次**，命中即中断生成（`OUTPUT_DETECT_INTERVAL_TOKENS` 可调 / 关闭）；
+- **多轮记忆**：同一会话里回灌之前的问答（轮数与 token 预算可配），聊天不再是「单轮失忆」；
 - 可选**检索增强（RAG）**，用安全示例引导模型；
 - **对话控制台**：流式输出、多会话历史、每条回复的检测结果可查；
 - **多用户账号**：注册登录后各看各的数据；
@@ -20,17 +21,17 @@
 ## 技术架构
 
 - **后端**：Python 3.10 + FastAPI，JWT 登录鉴权（访问令牌 + HttpOnly 刷新 Cookie），SQLAlchemy 会话持久化（默认 SQLite，可切 PostgreSQL）。
-- **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」；流式生成每约 512 token 增量检测一次、命中即中断，事件经状态图逐节点推送（SSE）。
-- **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库、Retriever 检索安全示例；检索失败自动降级为原始输入，检测记录里区分「未启用」与「降级（附失败原因）」。
-- **模型调用**：聊天生成、输入/输出检测的 LLM 调用统一走 LangChain `ChatOpenAI` + `ChatPromptTemplate`（本地服务或云端接口均可，OpenAI 兼容）。
+- **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」；检测节点挂了 `RetryPolicy`（只重试内部异常，并发繁忙的 503 不重试）；流式生成每约 512 token 增量检测一次、命中即中断，事件经状态图逐节点推送（SSE）。
+- **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库与官方索引持久化、按距离阈值过滤 + 去重检索安全示例；检索失败自动降级为原始输入，没命中则跳过上下文增强；检测记录里区分「未启用 / 已启用 / 未命中 / 降级（附失败原因）」。
+- **模型调用**：聊天生成、输入/输出检测的 LLM 调用统一走 LangChain `ChatOpenAI` + `ChatPromptTemplate`（本地服务或云端接口均可，OpenAI 兼容）；输出检测用结构化 JSON 判定（解析失败先做一次修复重试），每次调用的耗时与 token 用量记入进程内指标（见 `GET /health` 的 `llm_metrics`）。
 - **推理服务**：本地自研的 OpenAI 兼容 LLM / Embedding 推理服务（FastAPI + transformers）。
 - **前端**：Vue 3 + Vite + TypeScript。
 
 ## 核心代码走读（想读源码的初学者看）
 
-只想用起来可以跳过本节。下面三段是项目里最关键的代码，都摘自真实文件，可对照阅读。
+只想用起来可以跳过本节。下面四段是项目里最关键的代码，都摘自真实文件，可对照阅读。
 
-**1）调用大模型：统一走 LangChain 的 `ChatOpenAI`**（`src/injection_guard/services/chat_client.py:47`）
+**1）调用大模型：统一走 LangChain 的 `ChatOpenAI`**（`src/injection_guard/services/chat_client.py:84`）
 
 ```python
 self.model = ChatOpenAI(
@@ -38,6 +39,7 @@ self.model = ChatOpenAI(
     base_url=self.base_url,       # 例如 http://localhost:8097/v1
     api_key=self.api_key,         # 本地服务不校验；留空时代码用 "EMPTY" 占位
     timeout=self.timeout,
+    callbacks=[MetricsCallbackHandler("chat")],  # 记录耗时 / token 用量
 )
 # 发一次请求；bind() 只覆盖「本次调用」的参数（前端调温度 / 生成长度时用）
 response = self._bind_model(max_tokens, temperature).invoke(messages)
@@ -47,28 +49,44 @@ response = self._bind_model(max_tokens, temperature).invoke(messages)
   所以换成本地服务或云端只改配置，代码不用动；
 - 流式回复用 `model.stream(messages)` 逐块 `yield`，网页上的打字机效果就来自这里。
 
-**2）RAG 检索：Embeddings → FAISS → Retriever**（`src/injection_guard/defense/rag.py:165`、`:203`）
+**2）多轮记忆：历史交给 `MessagesPlaceholder`，超预算自动裁剪**（`src/injection_guard/services/chat_client.py:100`）
+
+```python
+CHAT_PROMPT = ChatPromptTemplate.from_messages(
+    [MessagesPlaceholder("history", optional=True), ("human", "{prompt}")]
+)
+# 先按 CHAT_HISTORY_MAX_TOKENS 裁到最近若干条再发给模型（本轮提问永远保留）
+messages = trim_messages(messages, max_tokens=..., strategy="last", token_counter=approximate_tokens)
+```
+
+- 历史由**服务端**按 `session_id` 从数据库读取（只取已完成的消息、剔除本次这条提问）：
+  前端只传 `session_id`、不传历史，客户端改不动上下文；
+- 历史只参与「生成」，不参与输入检测：每次仍只检测**本轮输入**（信任边界见下）。
+
+**3）RAG 检索：Embeddings → FAISS → 阈值过滤 + 去重**（`src/injection_guard/defense/rag.py:291`、`:353`）
 
 ```python
 # 用已经算好的向量建索引（不重复调用 embedding 服务）
 self._store = FAISS.from_embeddings(text_embeddings, self.embeddings, metadatas=metadatas)
-# 检索最相似的安全示例，返回 list[Document]
-retriever = self._store.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
-documents = retriever.invoke(user_query)
+# 检索时拿到 (Document, 距离)：按 RAG_MAX_DISTANCE 过滤，再按文本去重
+scored = self._store.similarity_search_with_score(user_query, k=limit)
 ```
 
-检索到的示例会被拼进最终 prompt（安全指令 + 相似示例 + 当前问题），检索失败自动降级为原始输入。
+检索到的示例会被拼进最终 prompt（安全指令 + 相似示例 + 当前问题）；一条都没命中（或全部被
+阈值过滤）时**不拼接空上下文**，直接用原始输入；检索失败同样降级，不阻断主流程。索引用 FAISS
+官方 `save_local/load_local` 落盘到 `resources/jailbreak_prompts_index/`，旧版 `.pt` 缓存首次启动自动迁移。
 
-**3）检测流水线：LangGraph 状态图**（`src/injection_guard/agent/pipeline.py:239`）
+**4）检测流水线：LangGraph 状态图**（`src/injection_guard/agent/pipeline.py:385`）
 
 ```python
 builder = StateGraph(PipelineState)                  # 状态 = 请求参数 + 各阶段产物
-builder.add_node("input_detection", bind(input_detection_node))
+builder.add_node("input_detection", bind(input_detection_node), retry_policy=retry_policy)
 # 输入不安全 → 直接 END，不再执行后续阶段
 builder.add_conditional_edges("input_detection", route_after_input, {"stop": END, "rag": "rag_retrieval"})
 ```
 
 - 节点（Node）= 一个步骤，条件边（Conditional Edge）= 分支；流程一眼可见，每个节点可单独测试；
+- `retry_policy` 只重试 `DetectionError`（下游抖动），`ServiceBusyError`（并发满 → 503）保持快速失败；
 - 流式请求用 `stream_mode=["custom", "values"]` 逐节点把事件推给前端（SSE）。
 
 按这个顺序读代码最省力：`services/chat_client.py`（调模型）→ `defense/rag.py`（检索）
@@ -189,7 +207,8 @@ npm run build      # 构建产物 frontend/dist，由后端在 :8099 直接托�
 2. 首次使用先**注册**账号并登录；
 3. 输入消息开始聊天——被判定不安全的输入会被拦截，不安全的回复会被替换为拦截提示；
 4. 点击「检测记录」查看每条回复对应的检查结果；
-5. 「设置」页可测试各模型服务的连通性、调整检索增强与检测敏感度。
+5. 「设置」页可测试各模型服务的连通性、调整检索增强与检测敏感度；
+6. 同一会话里的追问会自动带上之前的对话（默认最近 10 轮 / 2048 token，`CHAT_HISTORY_MAX_TURNS=0` 可关闭）。
 
 交互式接口文档：**http://localhost:8099/docs**。
 
@@ -212,5 +231,17 @@ cd frontend && npm test     # 前端测试
 - `.env`：访问地址、连接信息、密钥等（复制 `.env.example`）。
 - `configs/deploy.env`：本地部署的端口与模型路径（复制 `deploy.env.example`）。
 - `configs/services.env`：各模型服务的检测参数（复制 `services.env.example`），例如 `OUTPUT_DETECT_INTERVAL_TOKENS`。
+
+常用的几个应用侧参数（写进 `.env` 或环境变量即可）：
+
+| 变量 | 默认值 | 作用 |
+|------|--------|------|
+| `CHAT_HISTORY_MAX_TURNS` | 10 | 回灌的历史轮数（0 = 关闭多轮记忆，退化为单轮） |
+| `CHAT_HISTORY_MAX_TOKENS` | 2048 | 历史消息的 token 预算，超出按「保留最近消息」裁剪 |
+| `RAG_MAX_DISTANCE` | 0 | 检索命中的最大距离（FAISS 欧氏距离，越小越相似；0 = 不过滤） |
+| `DETECT_NODE_MAX_ATTEMPTS` | 2 | 检测节点最多尝试次数（1 = 不重试；只重试内部异常，503 不重试） |
+
+**信任边界**：多轮记忆只把历史交给「生成」，输入检测永远只看本轮输入。历史消息在入库前
+已经过当次输入检测或被标记为拦截，因此存入数据库的正文是「通过检测的内容」或拦截文案。
 
 所有示例文件均以 `.example` 结尾：复制为**同名文件**后按需修改即可，真实配置不会进入版本库。

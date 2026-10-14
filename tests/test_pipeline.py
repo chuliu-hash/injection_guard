@@ -48,6 +48,7 @@ class _StubService(DefenseService):
         self._chat_reply = chat_reply
         self.chat_prompts = []
         self.chat_params = []
+        self.chat_history = []
         self.output_calls = []
 
     def _run_input_detection_guarded(self, **_kw):
@@ -62,9 +63,10 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None):
+    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
         self.chat_prompts.append(prompt)
         self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
+        self.chat_history.append(history)
         return self._chat_reply
 
 
@@ -81,8 +83,20 @@ def test_generates_response_when_not_provided():
     svc = _StubService(_settings(), input_result=SAFE_INPUT)
     outcome = svc.detect(user_input="你好")
     assert svc.chat_prompts == ["你好"]
+    assert svc.chat_history == [None]  # 没给历史就是单轮
     assert outcome.model_response == "REPLY"
     assert outcome.stopped_at is None
+
+
+def test_history_is_forwarded_to_chat():
+    """多轮记忆：历史由服务端读好传进来，原样转给聊天客户端。"""
+    history = [
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+    ]
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    svc.detect(user_input="第二问", history=history)
+    assert svc.chat_history == [history]
 
 
 def test_chat_generation_params_passed_through():

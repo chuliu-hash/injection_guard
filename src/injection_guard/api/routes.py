@@ -7,14 +7,16 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..agent.state import final_assistant_content
+from ..config import get_settings
 from ..persistence.database import get_database
 from ..persistence.repository import SessionRepository
+from ..services import llm_metrics
 from .dependencies import (
     DefenseService,
     DetectionError,
@@ -57,6 +59,8 @@ def health(service: DefenseService = Depends(get_defense_service)) -> dict:
         "skip_output_when_high_confidence": settings.skip_output_when_high_confidence,
         "safe_skip_threshold": settings.safe_skip_threshold,
         "enable_rag": settings.enable_rag,
+        # 进程内 LLM 指标（调用次数 / 平均耗时 / token 用量；重启归零）
+        "llm_metrics": llm_metrics.snapshot(),
     }
 
 
@@ -273,6 +277,33 @@ async def _sse_event_stream(
         cancelled.set()
 
 
+def _load_chat_history(
+    session_id: Optional[str], user_id: str, user_input: str
+) -> Optional[List[Dict[str, str]]]:
+    """按会话读取多轮历史（**服务端读取**，前端只传 session_id）。
+
+    只取已完成的消息、剔除本次这条用户输入，并按 ``CHAT_HISTORY_MAX_TURNS`` 截断
+    （token 预算的裁剪在 ``ChatClient`` 里做）。任何异常都降级为「无历史」——记忆
+    功能不该让聊天失败。
+    """
+    if not session_id:
+        return None
+    max_turns = get_settings().chat_history_max_turns
+    if max_turns <= 0:
+        return None
+    try:
+        with get_database().session() as db:
+            history = SessionRepository(db, user_id=user_id).load_history(
+                session_id, max_turns=max_turns, exclude_trailing_user=user_input
+            )
+    except Exception:  # noqa: BLE001 - 读历史失败按无历史处理
+        logger.warning("[chat] 读取会话历史失败: session=%s", session_id, exc_info=True)
+        return None
+    if history:
+        logger.info("[chat] 注入 %d 条历史消息: session=%s", len(history), session_id)
+    return history or None
+
+
 @router.post(
     "/api/chat_stream",
     summary="流式防御流水线（SSE）：输入检测 ->（可选 RAG）-> 流式聊天 -> 输出检测",
@@ -310,6 +341,8 @@ async def chat_stream(
         "max_tokens": payload.max_tokens,
         "safe_skip_threshold": payload.safe_skip_threshold,
         "skip_output_when_high_confidence": payload.skip_output_when_high_confidence,
+        # 多轮记忆：服务端从会话里读历史（前端只传 session_id，不信任前端传的历史）
+        "history": _load_chat_history(payload.session_id, user_id, data["user_input"]),
     }
     # 带会话定位时，由服务端在生成结束时落库助手正文（见 _AssistantPersistTarget）
     persist_target: Optional[_AssistantPersistTarget] = None

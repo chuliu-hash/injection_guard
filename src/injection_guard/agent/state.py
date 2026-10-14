@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 # 客户端断流后由编排层写入 ``stopped_at`` 的内部标记：仅用于让状态图就地结束，
 # 不会出现在 SSE ``done`` 事件里（此时已无人消费）。
@@ -40,6 +40,9 @@ class PipelineState(TypedDict, total=False):
     # ── 请求参数（入口写入，节点只读）────────────────────────────────
     user_input: str
     model_response: Optional[str]
+    # 多轮记忆：之前的对话（按时间顺序，``[{"role": "user"|"assistant", "content": ...}]``）。
+    # 由服务端按会话读取后写入，仅用于生成阶段的上下文，不参与输入检测。
+    history: List[Dict[str, str]]
     use_rag: bool
     sensitivity: Optional[str]
     use_bert: bool

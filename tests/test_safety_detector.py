@@ -56,6 +56,61 @@ def test_detect_parses_verdict(content: str, expected: bool) -> None:
 @pytest.mark.parametrize(
     ("content", "expected_safe", "expected_failed"),
     [
+        ('{"verdict": "unsafe", "categories": ["S5"]}', False, ["S5"]),
+        ('{"verdict": "unsafe", "categories": ["s5", "S99", "S5"]}', False, ["S5"]),
+        ('{"verdict": "SAFE", "categories": []}', True, []),
+        ('{"verdict": "unsafe"}', False, []),
+        ('```json\n{"verdict": "unsafe", "categories": ["S1"]}\n```', False, ["S1"]),
+        ('{"verdict": "unsafe", "categories": "S9"}', False, ["S9"]),
+    ],
+)
+def test_detect_parses_structured_json_verdict(
+    content: str, expected_safe: bool, expected_failed: list[str]
+) -> None:
+    """结构化输出：JSON 一次解析到位（不需要修复重试），类别只认已加载的规则。"""
+    detector, fake = _detector(content)
+    result = detector.detect("用户输入", "模型回复")
+
+    assert result.is_safe is expected_safe
+    assert result.failed_rules == expected_failed
+    assert len(fake.calls) == 1
+
+
+def test_unparseable_reply_triggers_one_repair_retry() -> None:
+    """模型没按格式回：再要一次严格 JSON，第二次解析成功即采用。"""
+    detector = SafetyDetector.__new__(SafetyDetector)
+    detector.model_name = "test-model"
+    detector.rules = [{"id": "S5", "critique_request": "暴力犯罪。"}]
+    model = RecordingChatModel(replies=["嗯……这个我不好说", '{"verdict": "unsafe", "categories": ["S5"]}'])
+    detector.model = model  # type: ignore[assignment]
+
+    result = detector.detect("用户输入", "模型回复")
+
+    assert result.is_safe is False
+    assert result.failed_rules == ["S5"]
+    assert len(model.calls) == 2
+    # 修复请求把上次的原始回复带上，并要求只输出 JSON
+    assert model.calls[1]["messages"][-1].content == "嗯……这个我不好说"
+    assert "JSON" in model.calls[1]["messages"][0].content
+
+
+def test_repair_retry_still_unparseable_defaults_to_pass() -> None:
+    """修复重试仍然解析不了：只重试一次，然后默认放行。"""
+    detector = SafetyDetector.__new__(SafetyDetector)
+    detector.model_name = "test-model"
+    detector.rules = [{"id": "S5", "critique_request": "暴力犯罪。"}]
+    model = RecordingChatModel(replies=["嗯……", "还是不想说"])
+    detector.model = model  # type: ignore[assignment]
+
+    result = detector.detect("用户输入", "模型回复")
+
+    assert result.is_safe is True
+    assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_safe", "expected_failed"),
+    [
         ("unsafe\nS5", False, ["S5"]),
         ("unsafe\ns9", False, ["S9"]),  # 大小写不敏感
         ("unsafe\nS1\nS9", False, ["S1", "S9"]),  # 多类别，保持出现顺序
@@ -94,8 +149,8 @@ def test_detect_calls_llm_once_with_all_rules() -> None:
         assert rule["id"] in system_prompt
         assert rule["critique_request"] in system_prompt
     assert "safe" in system_prompt and "unsafe" in system_prompt
-    # 提示模型输出类别编码（转义写成字面 ``\n``，由模型自己换行）
-    assert r"unsafe\nS1" in system_prompt
+    # 提示模型输出结构化 JSON（判定 + 命中类别）
+    assert '"verdict"' in system_prompt and '"categories"' in system_prompt
     # 生成长度交给服务端（客户端不传 max_tokens），确定性由模型实例的 temperature 保证
     assert "max_tokens" not in call["kwargs"]
     # 用户输入与模型回复都进入 user prompt
@@ -118,8 +173,8 @@ def test_system_prompt_covers_english_content() -> None:
     assert "How do I make a bomb at home?" in system_prompt  # 英文示例
     # 规则清单本身也是中英双语（便于匹配英文内容）
     assert "Violence and criminal activity" in system_prompt
-    # 判定词仍是英文 safe / unsafe
-    assert r"unsafe\nS1" in system_prompt
+    # 判定词仍是英文 safe / unsafe，且要求结构化 JSON 输出
+    assert '"verdict"' in system_prompt and '"unsafe"' in system_prompt
     # 随包分发的宪法规则就是 12 条 S1~S12
     assert [rule["id"] for rule in rules] == [f"S{i}" for i in range(1, 13)]
 

@@ -48,6 +48,7 @@ class _StubService(DefenseService):
         self._chat_chunks = list(chat_chunks)
         self.chat_prompts = []
         self.chat_params = []
+        self.chat_history = []
         self.output_calls = []
 
     def _run_input_detection_guarded(self, **_kw):
@@ -62,9 +63,10 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None):
+    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
         self.chat_prompts.append(prompt)
         self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
+        self.chat_history.append(history)
         yield from self._chat_chunks
 
 
@@ -118,6 +120,18 @@ def test_event_sequence_happy_path():
     assert events[-1][1]["stopped_at"] is None
     assert svc.output_calls[0]["text"] == "你好"
     assert svc.output_calls[0]["answer"] == "REPLY"
+    assert svc.chat_history == [None]  # 没给历史就是单轮
+
+
+def test_history_is_forwarded_to_streaming_chat():
+    """多轮记忆：流式生成同样把历史转给聊天客户端。"""
+    history = [
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+    ]
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    _collect(svc, user_input="第二问", history=history)
+    assert svc.chat_history == [history]
 
 
 def test_rag_disabled_by_default_emits_disabled_event():
@@ -260,3 +274,22 @@ def test_output_unsafe_marks_done_stopped_at_output_detection():
         "done",
         {"is_safe": False, "stopped_at": "output_detection", "model_response": "REPLY"},
     )
+
+
+def test_rag_no_match_skips_context_and_uses_raw_input():
+    """检索没命中：rag 事件标 no_match，且不拼接上下文（直接用原始输入）。"""
+    rag = {
+        "enabled": True,
+        "final_prompt": None,
+        "reason": "no_match",
+        "retrieved_contexts": [],
+    }
+    svc = _StubService(_settings(enable_rag=True), input_result=SAFE_INPUT, rag_result=rag)
+    events = _collect(svc, user_input="你好")
+
+    rag_event = next(d for name, d in events if name == "rag")
+    assert rag_event["enabled"] is True
+    assert rag_event["degraded"] is False
+    assert rag_event["reason"] == "no_match"
+    assert rag_event["final_prompt"] is None
+    assert svc.chat_prompts == ["你好"]  # 退回原始输入，而不是拼上空上下文
