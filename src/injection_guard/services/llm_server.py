@@ -1,4 +1,4 @@
-"""OpenAI API 兼容的本地 LLM 推理服务（支持 Logprobs）。
+"""OpenAI API 兼容的本地 LLM 推理服务（支持 Logprobs 与 response_format）。
 
 高并发原理：
   - FastAPI 异步端点可同时接受大量 HTTP 连接（不阻塞事件循环）；
@@ -20,7 +20,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import uvicorn
@@ -67,12 +67,90 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = None
+    # OpenAI 兼容的「结构化输出」参数（langchain 的 with_structured_output 会发它）：
+    #   {"type": "json_object"} 或
+    #   {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": true}}
+    # 本地推理没有 logits 级约束解码（不想为一个功能引入 xgrammar / lm-format-enforcer
+    # 这类新依赖），这里等价实现为「注入 JSON 指令 -> 生成 -> 校验 -> 不合法就重试一次」，
+    # 见 _json_instruction / _json_text。**不保证** 100% 合法，客户端仍需解析兜底。
+    response_format: Optional[Dict[str, Any]] = None
 
     def effective_max_tokens(self) -> Optional[int]:
         """请求体的生成长度上限（兼容 max_tokens / max_completion_tokens 两种字段名）。"""
         if self.max_completion_tokens is not None:
             return self.max_completion_tokens
         return self.max_tokens
+
+
+def _json_instruction(response_format: Optional[Dict[str, Any]], *, strict: bool = False) -> Optional[str]:
+    """把 ``response_format`` 翻译成给本地模型的「只输出 JSON」指令；不需要则返回 None。
+
+    ``strict=True`` 用于生成结果不是合法 JSON 后的重试，措辞更强硬。
+    """
+    if not response_format:
+        return None
+    fmt = str(response_format.get("type") or "").lower()
+    if fmt not in {"json_object", "json_schema"}:
+        return None
+
+    parts = ["你必须只输出一个合法的 JSON 值，不要输出任何解释、Markdown 代码块标记或多余文字。"]
+    if fmt == "json_schema":
+        spec = response_format.get("json_schema") or {}
+        schema = spec.get("schema") if isinstance(spec, dict) else None
+        if schema is None and isinstance(spec, dict):
+            schema = spec  # 少数客户端直接把 schema 放在 json_schema 下
+        if schema:
+            parts.append("输出的 JSON 必须严格符合以下 JSON Schema：")
+            parts.append(json.dumps(schema, ensure_ascii=False))
+    if strict:
+        parts.append("上一次输出不是合法 JSON。这次必须从第一个字符就是 { 或 [，并输出完整闭合的 JSON。")
+    return "\n".join(parts)
+
+
+def _json_text(text: str) -> Optional[str]:
+    """从模型回复里取出 JSON 文本；取不到返回 None。
+
+    容忍常见的 ```json 代码块包裹与前后寒暄（取第一个 ``{``/``[`` 到最后一个 ``}``/``]``）。
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = [line for line in stripped.splitlines() if not line.strip().startswith("```")]
+        stripped = "\n".join(lines).strip()
+    if not stripped:
+        return None
+
+    starts = [index for index in (stripped.find("{"), stripped.find("[")) if index >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    end = max(stripped.rfind("}"), stripped.rfind("]"))
+    if end <= start:
+        return None
+    return stripped[start : end + 1]
+
+
+def _is_valid_json(text: str) -> bool:
+    """判断模型输出能否解析成 JSON（用于决定要不要重试一次）。"""
+    candidate = _json_text(text)
+    if candidate is None:
+        return False
+    try:
+        json.loads(candidate)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _messages_with_json_instruction(request: ChatCompletionRequest) -> List[ChatMessage]:
+    """在对话末尾追加「只输出 JSON」指令（``response_format`` 缺省时原样返回）。
+
+    指令作为独立的 user 消息追加在末尾，而不是拼进 chat template 的前缀，
+    以免破坏 Qwen 等模板对 ``<|im_start|>`` 角色的依赖。
+    """
+    instruction = _json_instruction(request.response_format)
+    if instruction is None:
+        return list(request.messages)
+    return [*request.messages, ChatMessage(role="user", content=instruction)]
 
 
 class ChatCompletionChoice(BaseModel):
@@ -423,11 +501,15 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 
 def _prepare_generation(
-    request: ChatCompletionRequest, output_scores: Optional[bool] = None
+    request: ChatCompletionRequest,
+    output_scores: Optional[bool] = None,
+    messages: Optional[List[ChatMessage]] = None,
 ) -> tuple:
     """准备 chat template、输入编码与 ``GenerationConfig``。
 
     ``output_scores`` 为 ``None`` 时取 ``request.logprobs``（流式路径显式传 False）。
+    ``messages`` 可覆盖请求自带的对话：默认在 ``response_format`` 存在时于末尾补一条
+    JSON 指令（见 :func:`_messages_with_json_instruction`），重试时传入更严格的版本。
     返回 ``(prompt, inputs, input_length, generation_config)``。
     """
     model = _model
@@ -438,16 +520,18 @@ def _prepare_generation(
     max_new_tokens_limit = settings.api_server_max_new_tokens
 
     # 1. Chat Template
+    if messages is None:
+        messages = _messages_with_json_instruction(request)
     try:
         prompt = tokenizer.apply_chat_template(
-            request.messages,
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("apply_chat_template 失败 (%s)，回退到简单拼接。", exc)
-        prompt = request.messages[-1].content
+        prompt = messages[-1].content
 
     # 2. 编码
     inputs = tokenizer(
@@ -609,26 +693,49 @@ async def _stream_chat_completion(request: ChatCompletionRequest):
 # ── 同步推理函数（在线程池中执行） ──
 
 
+def _run_generation(
+    request: ChatCompletionRequest, messages: Optional[List[ChatMessage]] = None
+) -> Tuple[Any, str, Any, int, Any]:
+    """执行一次同步生成。
+
+    返回 ``(outputs, response_text, generated_ids, input_length, inputs)``；
+    调用方负责在 ``finally`` 中释放 ``inputs`` / ``outputs`` 并清理显存缓存。
+    """
+    model = _model
+    tokenizer = _tokenizer
+    _prompt, inputs, input_length, generation_config = _prepare_generation(
+        request, messages=messages
+    )
+    try:
+        with torch.inference_mode():
+            outputs = model.generate(**{**inputs, "generation_config": generation_config})
+    except Exception:
+        logger.exception("Generation Error")
+        del inputs
+        _maybe_empty_cuda_cache(force=True)
+        raise
+
+    generated_ids = outputs.sequences[0][input_length:]
+    response_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    return outputs, response_text, generated_ids, input_length, inputs
+
+
 def _chat_completion_sync(request: ChatCompletionRequest) -> ChatCompletionResponse:
     """同步执行模型推理（在 ThreadPoolExecutor 线程池中运行）。"""
     model = _model
     tokenizer = _tokenizer
 
-    _prompt, inputs, input_length, generation_config = _prepare_generation(request)
-    generation_kwargs = {**inputs, "generation_config": generation_config}
-
-    # 4. 生成
-    try:
-        with torch.inference_mode():
-            outputs = model.generate(**generation_kwargs)
-    except Exception:
-        logger.exception("Generation Error")
-        _maybe_empty_cuda_cache(force=True)
-        raise
-
-    # 5. 解码
-    generated_ids = outputs.sequences[0][input_length:]
-    response_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    # 4. 生成（response_format 存在时等价实现为「JSON 指令 + 校验 + 重试一次」）
+    outputs, response_text, generated_ids, input_length, inputs = _run_generation(request)
+    if request.response_format and not _is_valid_json(response_text):
+        logger.warning("输出不是合法 JSON，追加严格指令后重试一次。")
+        del inputs, outputs, generated_ids
+        _maybe_empty_cuda_cache()
+        strict_instruction = _json_instruction(request.response_format, strict=True)
+        retry_messages = [*request.messages, ChatMessage(role="user", content=strict_instruction)]
+        outputs, response_text, generated_ids, input_length, inputs = _run_generation(
+            request, messages=retry_messages
+        )
 
     # 6. Logprobs
     logprobs_data = None

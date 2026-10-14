@@ -412,6 +412,11 @@ class Detector:
         """调用 LLM 进行复审。
 
         ``llm_accept_threshold`` 为本次调用的采纳阈值（缺省用实例默认档位的值）。
+
+        这里**刻意不用** ``with_structured_output``：LLM 复审的可信度来自首个回答 token 的
+        logprob（``exp(logprob)`` 与采纳阈值比对），而结构化输出会把首 token 变成 JSON 的
+        ``{``，safe/unsafe 的概率就取不到了。推理服务已支持 ``response_format``
+        （见 ``services/llm_server``），若换成不需要置信度门控的方案，可自行改成结构化输出。
         """
         accept_threshold = (
             self.llm_accept_threshold

@@ -24,7 +24,7 @@
 - **检测流水线**：由 **LangGraph** 状态图编排 `输入检测 → RAG 检索 → 生成 → 输出检测`，条件边负责「输入命中即拦截」与「高置信跳过输出检测」；检测节点挂了 `RetryPolicy`（只重试内部异常，并发繁忙的 503 不重试）；流式生成每约 512 token 增量检测一次、命中即中断，事件经状态图逐节点推送（SSE）。
 - **RAG 检索**：基于 **LangChain** —— 自定义 `Embeddings` 适配本地向量服务、FAISS 向量库与官方索引持久化、按距离阈值过滤 + 去重检索安全示例；检索失败自动降级为原始输入，没命中则跳过上下文增强；检测记录里区分「未启用 / 已启用 / 未命中 / 降级（附失败原因）」。
 - **模型调用**：聊天生成、输入/输出检测的 LLM 调用统一走 LangChain `ChatOpenAI` + `ChatPromptTemplate`（本地服务或云端接口均可，OpenAI 兼容）；输出检测用结构化 JSON 判定（解析失败先做一次修复重试），每次调用的耗时与 token 用量记入进程内指标（见 `GET /health` 的 `llm_metrics`）。
-- **推理服务**：本地自研的 OpenAI 兼容 LLM / Embedding 推理服务（FastAPI + transformers）。
+- **推理服务**：本地自研的 OpenAI 兼容 LLM / Embedding 推理服务（FastAPI + transformers），兼容 `response_format`（`json_object` / `json_schema`），`with_structured_output` 可直接指向它。
 - **前端**：Vue 3 + Vite + TypeScript。
 
 ## 核心代码走读（想读源码的初学者看）
@@ -136,6 +136,19 @@ huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-d
 抢显存导致 CUDA OOM；若候选卡都不足则本次不加载 BERT，输入检测退化为 LLM 复审。
 模型在**服务启动时同步加载**（`WARMUP_ON_STARTUP=true`，默认）：启动日志会出现「输入检测器池加载完成」，
 之后 `Application startup complete`；置为 `false` 则退回「首个检测请求时才加载」。
+
+### 结构化输出（`response_format`）
+
+8094 的推理服务接受 OpenAI 的 `response_format`，因此 LangChain 的 `with_structured_output(...)`
+可以直接把 `base_url` 指向本地服务。这是**等价实现**而非 logits 级约束解码（不为一个功能引入
+xgrammar / lm-format-enforcer 等依赖）：把「只输出 JSON」的指令追加到对话末尾 → 生成 → 校验；
+非流式请求若输出不是合法 JSON，会带更严格的指令**重试一次**，仍不合法就原样返回（客户端解析兜底）；
+流式请求只注入指令，不校验、不重试。
+
+- 输出检测（通用模型）用 `JsonOutputParser` + 一次修复重试拿结构化判定，解析不了再回落旧文本格式，
+  不依赖服务端是否支持约束解码。
+- 输入检测**刻意不用**结构化输出：它的置信度来自首个回答 token 的 logprob（与档位的
+  `llm_accept` 阈值比对），改成 JSON 后首 token 变成 `{`，概率门控就失效了。
 
 ## 环境准备
 
