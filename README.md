@@ -51,7 +51,7 @@ injection-guard-deploy --dry-run  # 只打印将要执行的命令，不真正�
 
 按需修改端口与模型路径；**生产环境务必在 `.env` 中设置 `JWT_SECRET_KEY`**（`openssl rand -hex 32`）。
 
-启动后打开 http://localhost:8099，注册账号即可使用；交互式接口文档见 http://localhost:8099/docs。
+启动后打开 `http://localhost:8099`，注册账号即可使用；交互式接口文档见 `http://localhost:8099/docs`。
 
 ### 默认端口
 
