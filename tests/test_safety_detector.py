@@ -8,8 +8,10 @@ from typing import Optional
 
 import pytest
 from fake_chat_model import RecordingChatModel
+from langchain_core.messages import AIMessage
+from pydantic import ValidationError
 
-from injection_guard.defense.safety_detector import SafetyDetector
+from injection_guard.defense.safety_detector import SafetyDetector, SafetyVerdict
 
 
 def _detector(content: Optional[str] = None, exc: Optional[Exception] = None, rules=None):
@@ -193,3 +195,134 @@ def test_no_rules_is_safe_without_calling_llm() -> None:
     assert result.is_safe is True
     assert result.total_rules == 0
     assert fake.calls == []
+
+
+# ── 结构化输出（with_structured_output + response_format）────────────────
+
+
+class _StructuredModelStub:
+    """最小模型桩：``with_structured_output`` 返回预设结果，``invoke`` 供修复重试用。"""
+
+    def __init__(self, structured_result=None, builder_exc: Optional[Exception] = None, reply: str = ""):
+        self.structured_result = structured_result
+        self.builder_exc = builder_exc
+        self.reply = reply
+        self.bound: Optional[tuple] = None
+        self.invocations: list = []
+        self.repair_calls: list = []
+        stub = self
+
+        class _Runnable:
+            def invoke(self, messages):
+                stub.invocations.append(messages)
+                return stub.structured_result
+
+        self._runnable = _Runnable()
+
+    def invoke(self, messages, **kwargs):
+        self.repair_calls.append(messages)
+        return AIMessage(content=self.reply)
+
+    def with_structured_output(self, schema, *, method=None, include_raw=False):
+        if self.builder_exc is not None:
+            raise self.builder_exc
+        self.bound = (schema, method, include_raw)
+        return self._runnable
+
+
+def _detector_with_stub(stub) -> SafetyDetector:
+    detector = SafetyDetector.__new__(SafetyDetector)
+    detector.model_name = "test-model"
+    detector.rules = [{"id": "S5", "critique_request": "暴力犯罪。"}]
+    detector.model = stub  # type: ignore[assignment]
+    detector._structured_cache = None
+    return detector
+
+
+def test_structured_output_is_preferred() -> None:
+    """结构化路径可用时：用 with_structured_output + json_object，一次调用拿到判定。"""
+    verdict = SafetyVerdict(verdict="unsafe", categories=["S5"])
+    stub = _StructuredModelStub(structured_result={"raw": AIMessage(content=verdict.model_dump_json()), "parsed": verdict, "parsing_error": None})
+    result = _detector_with_stub(stub).detect("用户输入", "模型回复")
+
+    assert (result.is_safe, result.failed_rules) == (False, ["S5"])
+    schema, method, include_raw = stub.bound
+    assert schema is SafetyVerdict and method == "json_mode" and include_raw is True
+    assert len(stub.invocations) == 1  # 结构化调用一次
+    assert stub.repair_calls == []  # 不需要修复重试
+
+
+def test_structured_raw_safe_verdict() -> None:
+    verdict = SafetyVerdict(verdict="safe", categories=[])
+    stub = _StructuredModelStub(
+        structured_result={"raw": AIMessage(content="{}"), "parsed": verdict, "parsing_error": None}
+    )
+    result = _detector_with_stub(stub).detect("用户输入", "模型回复")
+    assert result.is_safe is True and result.failed_rules == []
+
+
+def test_structured_parse_error_goes_to_repair_once() -> None:
+    """结构化解析失败：拿原始回复做一次修复重试，成功即采用（不再重复主调用）。"""
+    stub = _StructuredModelStub(
+        structured_result={
+            "raw": AIMessage(content="嗯……这个我不好说"),
+            "parsed": None,
+            "parsing_error": ValueError("invalid json"),
+        },
+        reply='{"verdict": "unsafe", "categories": ["S5"]}',
+    )
+    result = _detector_with_stub(stub).detect("用户输入", "模型回复")
+
+    assert (result.is_safe, result.failed_rules) == (False, ["S5"])
+    assert len(stub.invocations) == 1  # 主调用只发生一次
+    assert len(stub.repair_calls) == 1  # 修复重试一次
+    assert stub.repair_calls[0][-1].content == "嗯……这个我不好说"
+
+
+@pytest.mark.parametrize("exc", [NotImplementedError("stub"), ValueError("response_format not supported")])
+def test_structured_unavailable_falls_back_to_plain_call(exc: Exception) -> None:
+    """模型桩或服务端不支持结构化参数时，回落普通调用 + JSON 解析。"""
+    stub = _StructuredModelStub(builder_exc=exc, reply='{"verdict": "unsafe", "categories": ["S5"]}')
+    result = _detector_with_stub(stub).detect("用户输入", "模型回复")
+
+    assert (result.is_safe, result.failed_rules) == (False, ["S5"])
+    assert stub.invocations == []  # 没走结构化
+    assert len(stub.repair_calls) == 1  # 走普通调用
+
+
+def test_structured_call_failure_falls_back_to_plain_call() -> None:
+    """结构化调用抛异常（服务端拒收 / 网络错）时回落普通调用。"""
+    stub = _StructuredModelStub(reply="unsafe")
+    stub._runnable = _BoomRunnable()
+    result = _detector_with_stub(stub).detect("用户输入", "模型回复")
+
+    assert result.is_safe is False
+    assert len(stub.repair_calls) == 1
+
+
+class _BoomRunnable:
+    """调用即失败的 Runnable（模拟服务端拒收 response_format）。"""
+
+    def invoke(self, messages):
+        raise RuntimeError("response_format not supported")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"verdict": "UNSAFE", "categories": ["S5"]},   # 大小写
+        {"verdict": " unsafe "},                        # 前后空格 + 缺 categories
+        {"verdict": "unsafe", "categories": "S5"},      # 类别给了单值字符串
+    ],
+)
+def test_safety_verdict_normalizes_model_output(payload: dict) -> None:
+    """结构化校验前先归一，避免大小写 / 单值类别这类小毛病触发回落。"""
+    verdict = SafetyVerdict.model_validate(payload)
+    assert verdict.verdict == ("unsafe" if "unsafe" in str(payload["verdict"]).lower() else "safe")
+    assert verdict.categories == ["S5"] if payload.get("categories") else verdict.categories == []
+
+
+def test_safety_verdict_rejects_unknown_verdict() -> None:
+    """判定词不在 safe / unsafe 里：校验失败（由调用方回落文本解析）。"""
+    with pytest.raises(ValidationError):
+        SafetyVerdict.model_validate({"verdict": "也许安全"})

@@ -1,10 +1,14 @@
 """输出侧检测：用一组「宪法规则」校验模型回复是否安全。
 
 规则来自 ``resources/CritiqueRequests.json``（S1~S12 共 12 条），但**只调用一次 LLM**：
-12 条规则整体写进 system prompt，模型优先回结构化 JSON
-（``{"verdict": "unsafe", "categories": ["S5"]}``），用 ``JsonOutputParser`` 解析并
-把结论**归因**到具体规则；本地模型偶尔不守格式时，先做一次「只输出 JSON」的修复重试，
-仍解析不了再回落到旧版 ``unsafe\\nS5`` 文本解析，最后才默认放行。
+12 条规则整体写进 system prompt，判定要求是 JSON（``{"verdict": "unsafe", "categories": ["S5"]}``），
+以便把结论**归因**到具体规则。
+
+优先用 LangChain 的结构化输出（``ChatOpenAI.with_structured_output``，返回校验过的
+:class:`SafetyVerdict`）：它绑定 ``response_format={"type": "json_object"}``，由服务端负责
+「只输出 JSON」（本地推理服务见 ``services/llm_server``；云端 OpenAI 兼容服务同样支持）。
+结构化路径不可用（模型不支持 / 服务端拒收该参数 / 解析失败）时逐级回落：普通调用 +
+``JsonOutputParser`` → 一次「只输出 JSON」的修复重试 → 旧版文本判定 → 默认放行。
 """
 
 from __future__ import annotations
@@ -14,12 +18,13 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field, field_validator
 
 from ..config import get_settings
 from ..llm_utils import message_text
@@ -35,6 +40,31 @@ _JSON_PARSER = JsonOutputParser()
 
 # system / user 两条消息的模板（具体内容由 ``_build_messages`` 渲染后注入）
 SAFETY_PROMPT = ChatPromptTemplate.from_messages([("system", "{system_prompt}"), ("human", "{user_prompt}")])
+
+
+class SafetyVerdict(BaseModel):
+    """结构化输出的判定结果（配合 ``with_structured_output`` 使用）。
+
+    ``verdict`` 用 ``Literal`` 收敛取值：模型给出别的词时校验失败，回落文本解析。
+    校验前先做归一（大小写、单值类别），减少「格式小毛病」导致的回落。
+    """
+
+    verdict: Literal["safe", "unsafe"] = "safe"
+    categories: List[str] = Field(default_factory=list)
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _normalize_verdict(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("categories", mode="before")
+    @classmethod
+    def _normalize_categories(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            return [value.decode() if isinstance(value, bytes) else value]
+        return value
 
 
 @dataclass
@@ -55,6 +85,16 @@ class DetectionResult:
 
 class SafetyDetector:
     """AI 输出安全检测器。"""
+
+    # 结构化输出方法：``json_mode`` 绑定 ``response_format={"type": "json_object"}``，
+    # 兼容面最广（本地服务、DeepSeek、vLLM、OpenAI 都认）；默认的 ``function_calling``
+    # 走 tools 参数，本地 GPTQ 服务不支持。换用支持严格约束解码的服务时，可改成
+    # ``json_schema``（配 ``strict=True``）让服务端保证字段级约束。
+    structured_method = "json_mode"
+
+    # (模型实例, 结构化 Runnable) 缓存：测试常替换 ``self.model``，故按实例身份判断是否重建。
+    # 用类属性兜底，``SafetyDetector.__new__`` 造出来的实例（测试用）也能读到。
+    _structured_cache: Optional[Tuple[Any, Any]] = None
 
     # ── System Prompt 模板：角色定义 + 12 条宪法规则（一次判完） ─────────
     # 判定结果带类别编码（``unsafe`` + 换行 + ``S5``），以便归因到具体规则。
@@ -233,26 +273,96 @@ Prediction:
             return None
         return self._parse_verdict(message_text(response.content).strip())
 
+    def _structured_runnable(self) -> Optional[Any]:
+        """把 ``self.model`` 包成结构化输出 Runnable；不可用时返回 ``None``。
+
+        模型桩（``BaseChatModel`` 默认实现）调用 ``with_structured_output`` 会抛
+        ``NotImplementedError``，云端服务可能拒收 ``response_format``——两种都只记一条
+        日志后回落到文本解析，不影响检测可用性。
+        """
+        model = self.model
+        cache = self._structured_cache
+        if cache is not None and cache[0] is model:
+            return cache[1]
+
+        runnable = None
+        builder = getattr(model, "with_structured_output", None)
+        if callable(builder):
+            try:
+                # include_raw=True：解析失败不抛异常，能同时拿到原始回复走修复重试
+                runnable = builder(SafetyVerdict, method=self.structured_method, include_raw=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("输出检测结构化输出不可用（回落文本解析）: %s", exc)
+        self._structured_cache = (model, runnable)
+        return runnable
+
+    def _verdict_from_value(self, value: Any) -> Optional[tuple]:
+        """把结构化输出（``SafetyVerdict`` 或 dict）归一成 ``(is_safe, failed_rules)``。"""
+        if isinstance(value, SafetyVerdict):
+            payload: Dict[str, Any] = value.model_dump()
+        elif isinstance(value, dict):
+            payload = value
+        else:
+            return None
+        verdict = str(payload.get("verdict") or "").lower()
+        if "unsafe" in verdict:
+            return False, self._filter_categories(payload.get("categories"))
+        if "safe" in verdict:
+            return True, []
+        return None
+
+    def _try_structured(self, messages: List[BaseMessage]) -> Tuple[Optional[tuple], Optional[str]]:
+        """尝试用结构化输出拿判定，返回 ``(parsed, raw_content)``。
+
+        - ``(parsed, raw)``：拿到可用判定，``raw`` 供日志 / 修复重试使用；
+        - ``(None, raw)``：模型答了但格式不对 → 调用方直接走修复重试，别重复调用；
+        - ``(None, None)``：结构化路径不可用 → 调用方走普通调用 + 文本解析。
+        """
+        runnable = self._structured_runnable()
+        if runnable is None:
+            return None, None
+
+        try:
+            result = runnable.invoke(messages)
+        except Exception as exc:  # noqa: BLE001 - 结构化调用失败退文本解析
+            logger.warning("输出检测结构化调用出错（回落文本解析）: %s", exc)
+            return None, None
+
+        if not isinstance(result, dict):  # 理论上 include_raw=True 一定返回 dict
+            return self._verdict_from_value(result), None
+
+        raw = message_text(result.get("raw").content).strip() if result.get("raw") else ""
+        if result.get("parsing_error") is not None or result.get("parsed") is None:
+            logger.warning(
+                "输出检测结构化解析失败（先做一次修复重试）: %s", result.get("parsing_error")
+            )
+            return None, raw
+        return self._verdict_from_value(result.get("parsed")), raw
+
     def detect(self, text: str, answer: str) -> DetectionResult:
         """检测模型回复是否安全（**一次 LLM 调用**判定全部 12 条规则）。
 
         - 调用失败（服务不可达 / 超时 / 返回体异常）记 warning 并**默认放行**；
-        - 回复优先按 JSON 解析（``verdict`` / ``categories``）；不是 JSON 时做一次修复重试，
-          仍不行再回落到 ``unsafe`` / ``safe`` 文本判定；
+        - 优先走结构化输出（``with_structured_output`` + ``response_format``），不可用时回落
+          普通调用 + JSON 解析；不是 JSON 时做一次修复重试，仍不行再回落到 ``unsafe`` /
+          ``safe`` 文本判定；
         - 完全解析不出来 → 默认放行。
         """
         if not self.rules:
             logger.warning("没有可用规则")
             return DetectionResult(True, [], 0)
 
-        try:
-            response = self.model.invoke(self._build_messages(text, answer))
-            content = message_text(response.content).strip()
-        except Exception as exc:  # noqa: BLE001 - 检测失败默认放行
-            logger.warning("输出检测调用出错（默认放行）: %s", exc)
-            return DetectionResult(True, [], len(self.rules))
+        messages = self._build_messages(text, answer)
+        parsed, content = self._try_structured(messages)
+        if content is None:
+            try:
+                response = self.model.invoke(messages)
+                content = message_text(response.content).strip()
+            except Exception as exc:  # noqa: BLE001 - 检测失败默认放行
+                logger.warning("输出检测调用出错（默认放行）: %s", exc)
+                return DetectionResult(True, [], len(self.rules))
+            parsed = self._parse_verdict(content)
 
-        parsed = self._parse_verdict(content)
         if parsed is None:
             parsed = self._repair_once(content)
         if parsed is None:
