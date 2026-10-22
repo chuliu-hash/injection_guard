@@ -25,10 +25,9 @@ logger = logging.getLogger(__name__)
 # 探测目标键（固定顺序：输入 / 输出 / RAG / 聊天）
 SERVICE_KEYS = ("input", "output", "rag", "chat")
 
-# 单次探测默认超时（秒）。取值考虑**冷启动**：本地 8B 检测模型空闲后首次推理
-# 实测 3s+（CUDA 预热），5s 会误报超时；10s 既容得下冷启动，健康时也在 1s 内返回。
-# 调用方仍可用 timeout 放大（上限 60s，足以覆盖真正的模型懒加载）。
-DEFAULT_TIMEOUT = 10.0
+# 单次探测默认超时（秒）。本地 9.4G 输入检测模型首次懒加载可能明显超过 10s，
+# 因此默认值必须覆盖冷启动，而不是只看健康状态下的推理耗时。
+DEFAULT_TIMEOUT = 60.0
 MIN_TIMEOUT = 0.5
 MAX_TIMEOUT = 60.0
 
@@ -60,9 +59,28 @@ def normalize_timeout(timeout: Optional[float]) -> float:
     return min(max(float(timeout), MIN_TIMEOUT), MAX_TIMEOUT)
 
 
-def resolve_targets(settings: Optional[Settings] = None) -> Dict[str, ProbeTarget]:
+def resolve_targets(
+    settings: Optional[Settings] = None,
+    chat_options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, ProbeTarget]:
     """由 ``Settings`` 派生四个探测目标（键 ``SERVICE_KEYS``）。"""
     settings = settings or get_settings()
+    chat_options = chat_options or {}
+    configured_chat_url = str(settings.chat_api_url or "").strip()
+    requested_chat_url = str(chat_options.get("api_url") or "").strip()
+    chat_url = requested_chat_url or configured_chat_url
+    chat_model = str(chat_options.get("model") or settings.chat_model)
+    # 前端会把服务端默认 URL 一并回传；只有地址确实变化时才算「自定义第三方地址」。
+    # 否则空 Key 会被误替换成 EMPTY，导致服务端 .env 中已配置的 Key 永远用不上。
+    custom_chat_url = bool(requested_chat_url) and (
+        requested_chat_url.rstrip("/") != configured_chat_url.rstrip("/")
+    )
+    chat_key = chat_options.get("api_key")
+    if isinstance(chat_key, str):
+        chat_key = chat_key.strip() or None
+    if chat_key is None:
+        # 自定义地址时不要把服务端默认 Key 发给第三方。
+        chat_key = _PLACEHOLDER_KEY if custom_chat_url else settings.chat_api_key or _PLACEHOLDER_KEY
     return {
         "input": ProbeTarget(
             key="input",
@@ -91,10 +109,10 @@ def resolve_targets(settings: Optional[Settings] = None) -> Dict[str, ProbeTarge
         "chat": ProbeTarget(
             key="chat",
             label="聊天 LLM",
-            base_url=settings.chat_api_url,
-            model=settings.chat_model,
+            base_url=chat_url,
+            model=chat_model,
             kind="chat",
-            api_key=settings.chat_api_key or _PLACEHOLDER_KEY,
+            api_key=chat_key,
         ),
     }
 
@@ -146,6 +164,7 @@ def check_services(
     settings: Optional[Settings] = None,
     services: Optional[Iterable[str]] = None,
     timeout: Optional[float] = None,
+    chat_options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """并发探测选定的服务（缺省四个全测）。
 
@@ -153,7 +172,7 @@ def check_services(
     未知的服务名会被忽略（路由层负责校验并返回 400）。
     """
     effective_timeout = normalize_timeout(timeout)
-    targets = resolve_targets(settings)
+    targets = resolve_targets(settings, chat_options=chat_options)
 
     if services is None:
         selected: List[ProbeTarget] = [targets[key] for key in SERVICE_KEYS]

@@ -27,6 +27,15 @@ class _FakeSettings:
     skip_output_when_high_confidence = True
     safe_skip_threshold = 0.5
     enable_rag = False
+    chat_api_url = "http://localhost:8097/v1"
+    chat_api_key = None
+    chat_model = "Qwen3-chat"
+    chat_temperature = 0.7
+    chat_max_tokens = 1024
+    chat_top_p = 0.9
+    chat_frequency_penalty = 0.0
+    chat_presence_penalty = 0.0
+    chat_seed = None
 
 
 class _FakeService:
@@ -107,16 +116,67 @@ def test_empty_model_response_returns_400():
 
 
 def test_generation_params_reach_service():
-    """路由把请求体的 temperature / max_tokens 透传给防御服务。"""
+    """路由把请求级聊天配置透传给防御服务。"""
     svc = _FakeService(outcome=DefendOutcome(True, None, SAFE_INPUT, None))
     client = _client(svc)
     resp = client.post(
         "/api/prompt_defend",
-        json={"user_input": "你好", "temperature": 0.3, "max_tokens": 64},
+        json={
+            "user_input": "你好",
+            "chat_api_url": "https://example.com/v1",
+            "chat_api_key": "secret",
+            "chat_model": "model-x",
+            "temperature": 0.3,
+            "max_tokens": 64,
+            "top_p": 0.8,
+            "frequency_penalty": 0.2,
+            "presence_penalty": 0.1,
+            "seed": 42,
+        },
     )
     assert resp.status_code == 200
-    assert svc.detect_kwargs["temperature"] == 0.3
-    assert svc.detect_kwargs["max_tokens"] == 64
+    assert svc.detect_kwargs["chat_options"] == {
+        "api_url": "https://example.com/v1",
+        "api_key": "secret",
+        "model": "model-x",
+        "temperature": 0.3,
+        "max_tokens": 64,
+        "top_p": 0.8,
+        "frequency_penalty": 0.2,
+        "presence_penalty": 0.1,
+        "seed": 42,
+    }
+
+
+def test_chat_defaults_excludes_api_key():
+    settings = _FakeSettings()
+    settings.chat_api_key = "server-secret"
+    service = _FakeService()
+    service.settings = settings
+    resp = _client(service).get("/api/chat_defaults")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["api_url"] == "http://localhost:8097/v1"
+    assert body["model"] == "Qwen3-chat"
+    assert body["api_key_configured"] is True
+    assert "api_key" not in body
+
+
+def test_thread_id_reaches_service_and_response():
+    trace = {"trace_id": "trace-1", "thread_id": "thread-1", "nodes": []}
+    outcome = DefendOutcome(
+        True, None, SAFE_INPUT, None, "回复", None, thread_id="thread-1", trace=trace
+    )
+    svc = _FakeService(outcome=outcome)
+    client = _client(svc)
+
+    resp = client.post("/api/prompt_defend", json={"user_input": "你好", "thread_id": "thread-1"})
+
+    assert resp.status_code == 200
+    assert svc.detect_kwargs["thread_id"] == "thread-1"
+    assert resp.json()["thread_id"] == "thread-1"
+    assert resp.json()["trace"]["trace_id"] == "trace-1"
 
 
 def test_sensitivity_reaches_service():
@@ -169,7 +229,24 @@ def test_max_tokens_non_positive_returns_400():
     client = _client(_FakeService())
     resp = client.post("/api/prompt_defend", json={"user_input": "hi", "max_tokens": 0})
     assert resp.status_code == 400
-    assert resp.json() == {"error": "max_tokens 必须 >= 1"}
+    assert resp.json() == {"error": "max_tokens 必须在 1~32768 之间"}
+
+
+def test_chat_url_must_be_http():
+    client = _client(_FakeService())
+    resp = client.post(
+        "/api/prompt_defend",
+        json={"user_input": "hi", "chat_api_url": "file:///etc/passwd"},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "chat_api_url 必须是 http(s) URL"}
+
+
+def test_top_p_out_of_range_returns_400():
+    client = _client(_FakeService())
+    resp = client.post("/api/prompt_defend", json={"user_input": "hi", "top_p": 1.5})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "top_p 必须在 0~1 之间"}
 
 
 def test_input_blocked_stops_at_input_detection():
@@ -252,10 +329,11 @@ def test_non_json_body_returns_400():
 def _stub_check_services(monkeypatch, recorder: Dict[str, Any]):
     """把 connectivity.check_services 换成桩：记录入参并返回固定报告。"""
 
-    def fake(settings, services=None, timeout=None):
+    def fake(settings, services=None, timeout=None, chat_options=None):
         recorder["settings"] = settings
         recorder["services"] = services
         recorder["timeout"] = timeout
+        recorder["chat_options"] = chat_options
         keys = list(services) if services else list(connectivity.SERVICE_KEYS)
         return {
             "ok": True,
@@ -306,6 +384,28 @@ def test_test_services_subset_and_timeout(monkeypatch):
     assert set(resp.json()["services"]) == {"chat"}
     assert recorder["services"] == ["chat"]
     assert recorder["timeout"] == 2.5
+
+
+def test_test_services_uses_request_chat_config(monkeypatch):
+    recorder: Dict[str, Any] = {}
+    _stub_check_services(monkeypatch, recorder)
+
+    resp = _client(_FakeService()).post(
+        "/api/test_services",
+        json={
+            "services": ["chat"],
+            "chat_api_url": "https://example.com/v1",
+            "chat_api_key": "secret",
+            "chat_model": "model-x",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert recorder["chat_options"] == {
+        "api_url": "https://example.com/v1",
+        "api_key": "secret",
+        "model": "model-x",
+    }
 
 
 def test_test_services_unknown_name_returns_400():

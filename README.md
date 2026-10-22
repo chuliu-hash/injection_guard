@@ -16,8 +16,8 @@
 
 ## 技术栈
 
-- **后端**：Python 3.10 + FastAPI；**LangGraph** 编排检测流水线，**LangChain** 做模型调用与 RAG 检索。
-- **持久化**：SQLAlchemy（默认 SQLite，可切 PostgreSQL）。
+- **后端**：Python 3.10 + FastAPI；**LangGraph** 编排检测流水线，**LangChain** 做模型调用，**Milvus** 做向量检索。
+- **持久化**：SQLAlchemy + PostgreSQL（唯一数据库后端，会话与 LangGraph 检查点共用）。
 - **推理服务**：transformers + FastAPI，提供 OpenAI 兼容接口。
 - **前端**：Vue 3 + Vite + TypeScript。
 
@@ -34,7 +34,10 @@
 
 ## 快速开始
 
-环境要求：Python 3.10+（建议 conda）；只在开发前端时需要 Node.js 20+；本地跑模型需要 NVIDIA GPU。
+环境要求：Python 3.10+（建议 conda）；PostgreSQL 13+；Milvus 2.4+（默认
+`http://localhost:19530`）；只在开发前端时需要 Node.js 20+；本地跑模型需要 NVIDIA GPU。
+默认连接 `postgresql://chuliu:123456@127.0.0.1:5432`，未写库名时使用与用户名同名的
+`chuliu` 数据库。
 
 ```bash
 # 1) 安装依赖
@@ -60,7 +63,8 @@ injection-guard-deploy --dry-run  # 只打印将要执行的命令，不真正�
 | 防御 API + 网页前端 | 8099 |
 | 输入检测 LLM | 8094 |
 | 输出检测 LLM | 8095 |
-| 向量检索（RAG） | 8096 |
+| Embedding 服务（RAG） | 8096 |
+| Milvus 向量数据库 | 19530 |
 | 聊天 LLM | 8097 |
 
 ### 分开启动 / 只用云端模型
@@ -72,6 +76,11 @@ scripts/serve_embed.sh   # 向量检索
 scripts/serve_chat.sh    # 聊天 LLM
 GPU_IDS=0,1 scripts/serve_embed.sh   # 临时指定 GPU
 ```
+
+RAG 的向量与文本存放在 Milvus；启动防御 API 前需先启动 Milvus Standalone（监听 19530），
+再启动 Embedding 服务 8096。地址可通过 `.env` 的 `MILVUS_URI` 覆盖。
+若应用运行在远程服务器、Milvus 在本地开发机，请把 `MILVUS_URI` 改成开发机的可达地址
+（例如 `http://192.168.1.10:19530`），不要使用服务器自身的 `localhost`。
 
 不想在本地跑大模型时，在 `.env` 里填好聊天服务的地址与密钥即可，无需启动 8097。
 
@@ -123,17 +132,31 @@ huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-d
 |------|--------|------|
 | `CHAT_HISTORY_MAX_TURNS` | 10 | 回灌的历史轮数（0 = 关闭多轮记忆） |
 | `CHAT_HISTORY_MAX_TOKENS` | 2048 | 历史消息的 token 预算，超出按「保留最近消息」裁剪 |
-| `RAG_MAX_DISTANCE` | 0 | 检索命中的最大距离（FAISS 欧氏距离，越小越相似；0 = 不过滤） |
+| `CHAT_API_URL` / `CHAT_MODEL` / `CHAT_API_KEY` | 本地聊天服务 | 聊天模型默认连接信息；前端设置页可逐请求覆盖 |
+| `CHAT_TEMPERATURE` / `CHAT_TOP_P` / `CHAT_MAX_TOKENS` | 0.7 / 0.9 / 1024 | 生成参数默认值；前端设置页运行时覆盖 |
+| `CHAT_FREQUENCY_PENALTY` / `CHAT_PRESENCE_PENALTY` / `CHAT_SEED` | 0 / 0 / 空 | 惩罚项与随机种子默认值 |
+| `MILVUS_URI` | `http://localhost:19530` | Milvus 服务地址 |
+| `MILVUS_COLLECTION` | `injection_guard_rag` | 安全示例向量集合名 |
+| `RAG_DIR` | `resources/rag` | 知识库目录，读取其中所有 JSON |
+| `RAG_META_PATH` | `resources/rag_milvus.json` | 知识库目录指纹元数据（向量不落本地） |
+| `RAG_MAX_DISTANCE` | 0 | 检索命中的最大距离（Milvus L2 距离，越小越相似；0 = 不过滤） |
 | `DETECT_NODE_MAX_ATTEMPTS` | 2 | 检测节点最多尝试次数（1 = 不重试） |
 | `OUTPUT_DETECT_INTERVAL_TOKENS` | 512 | 流式回复的增量检测间隔（0 = 关闭） |
+| `DATABASE_URL` | `postgresql://chuliu:123456@127.0.0.1:5432` | PostgreSQL DSN；其他数据库 URL 会被拒绝 |
 
 ## 测试
 
 ```bash
-pytest                                  # 后端
+pytest                                  # 后端（需要可连接的 PostgreSQL）
 cd frontend && npm test                 # 前端
 ruff check src tests                    # lint（ruff format 格式化）
+scripts/run_p1.sh                       # P1 非交互式验证（ruff + pytest + 评测自检）
+injection-guard-eval --cases eval/golden_cases.jsonl  # 真实模型离线评测
 ```
+
+测试会为每个用例创建独立的 PostgreSQL schema 并在结束后删除，不会污染业务表。
+`scripts/run_p1.sh` 默认使用 `injection_guard` conda 环境，可用
+`PYTHON_BIN=/path/to/python` 覆盖；所有检查执行完才汇总退出，不会中途等待输入。
 
 ## 常见问题
 

@@ -14,6 +14,7 @@ import pytest
 from injection_guard import cli
 from injection_guard.cli import deploy
 from injection_guard.config import (
+    DEFAULT_DATABASE_URL,
     DeploySettings,
     Settings,
     get_deploy_settings,
@@ -70,6 +71,29 @@ def test_dotenv_side_fields_still_work(tmp_path: Path) -> None:
     settings = Settings(_env_file=(dotenv, tmp_path / "missing.env"))
     assert settings.app_port == 1234
     assert settings.chat_model == "my-model"
+
+
+def test_default_database_is_postgres(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    settings = Settings(_env_file=None)
+    assert DEFAULT_DATABASE_URL == "postgresql://chuliu:123456@127.0.0.1:5432"
+    assert settings.database_url == DEFAULT_DATABASE_URL
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite:///./data/injection_guard.db",
+        "mysql+pymysql://user:pw@localhost/db",
+        "postgres://user:pw@localhost/db",
+    ],
+)
+def test_non_postgresql_database_urls_are_rejected(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", url)
+    with pytest.raises(ValueError, match="仅支持 PostgreSQL"):
+        Settings(_env_file=None)
 
 
 # ── DeploySettings ─────────────────────────────────────────────────────

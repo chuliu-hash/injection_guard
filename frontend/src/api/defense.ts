@@ -1,4 +1,10 @@
-import type { ChatStreamRequest, DefendResponse, HealthInfo, TestServicesResponse } from '@/types'
+import type {
+  ChatDefaults,
+  ChatStreamRequest,
+  DefendResponse,
+  HealthInfo,
+  TestServicesResponse,
+} from '@/types'
 
 import { apiUrl, getJson, postJson } from './http'
 import { postSse } from './sse'
@@ -22,9 +28,20 @@ export function fetchHealth(signal?: AbortSignal): Promise<HealthInfo> {
   return getJson<HealthInfo>('/health', signal)
 }
 
+/** 聊天模型的服务端默认值（不含密钥）；运行中修改 env 需重启后端。 */
+export function fetchChatDefaults(signal?: AbortSignal): Promise<ChatDefaults> {
+  return getJson<ChatDefaults>('/api/chat_defaults', signal)
+}
+
 /** 测试四个下游模型服务（输入/输出/RAG/聊天）的连通性。 */
 export function testServices(
-  options: { services?: string[]; timeout?: number } = {},
+  options: {
+    services?: string[]
+    timeout?: number
+    chat_api_url?: string
+    chat_api_key?: string
+    chat_model?: string
+  } = {},
   signal?: AbortSignal,
 ): Promise<TestServicesResponse> {
   return postJson<TestServicesResponse>('/api/test_services', options, signal)

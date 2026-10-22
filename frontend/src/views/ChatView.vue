@@ -34,6 +34,9 @@ const messages = computed(() => session.value?.messages ?? [])
 const detections = computed(() => session.value?.detections ?? {})
 
 onMounted(async () => {
+  void settings.ensureChatDefaults().catch(() => {
+    // 后端暂不可用时继续使用内置值；发送请求时仍会使用服务端默认配置。
+  })
   try {
     const param = route.params.sessionId
     const session = await store.activate(typeof param === 'string' ? param : undefined)
@@ -90,8 +93,15 @@ async function send(rawText: string): Promise<void> {
         assistant_message_id: assistant.id,
         use_rag: settings.useRag,
         sensitivity: settings.sensitivity,
+        chat_api_url: settings.chatApiUrl.trim() || undefined,
+        chat_api_key: settings.chatApiKey.trim() || undefined,
+        chat_model: settings.chatModel.trim() || undefined,
         temperature: settings.chatTemperature,
         max_tokens: settings.chatMaxTokens,
+        top_p: settings.chatTopP,
+        frequency_penalty: settings.chatFrequencyPenalty,
+        presence_penalty: settings.chatPresencePenalty,
+        seed: settings.chatSeed ?? undefined,
         safe_skip_threshold: settings.safeSkipThreshold,
         skip_output_when_high_confidence: settings.skipOutputWhenHighConfidence,
       },

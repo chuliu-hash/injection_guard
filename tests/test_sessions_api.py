@@ -1,4 +1,4 @@
-"""会话持久化 API 测试：临时 SQLite，不依赖 GPU / 模型。
+"""会话持久化 API 测试：临时 PostgreSQL schema，不依赖 GPU / 模型。
 
 覆盖：会话与消息的完整生命周期、检测记录写入、标题自动生成、
 分页列表、删除级联、清空、**跨用户隔离**，以及未登录返回 401。
@@ -15,8 +15,8 @@ from injection_guard.persistence.database import get_database
 PASSWORD = "s3cret-pass"
 
 
-def _client(tmp_path, monkeypatch) -> TestClient:
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
+def _client(postgres_database_url, monkeypatch) -> TestClient:
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     get_settings.cache_clear()
     get_database.cache_clear()
     from injection_guard.api.app import create_app
@@ -31,20 +31,16 @@ def _register(client: TestClient, username: str) -> dict:
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    with _client(tmp_path, monkeypatch) as test_client:
+def client(postgres_database_url, monkeypatch):
+    with _client(postgres_database_url, monkeypatch) as test_client:
         test_client.headers.update(_register(test_client, "owner"))
         yield test_client
-    get_settings.cache_clear()
-    get_database.cache_clear()
 
 
-def test_sessions_require_authentication(tmp_path, monkeypatch) -> None:
-    with _client(tmp_path, monkeypatch) as test_client:
+def test_sessions_require_authentication(postgres_database_url, monkeypatch) -> None:
+    with _client(postgres_database_url, monkeypatch) as test_client:
         assert test_client.get("/api/sessions").status_code == 401
         assert test_client.post("/api/sessions", json={}).status_code == 401
-    get_settings.cache_clear()
-    get_database.cache_clear()
 
 
 def test_session_and_message_lifecycle(client: TestClient) -> None:

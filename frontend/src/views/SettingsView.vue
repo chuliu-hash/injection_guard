@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { testServices } from '@/api/defense'
@@ -14,13 +14,21 @@ const session = useSessionStore()
 /** 固定展示顺序（与后端 SERVICE_KEYS 一致）。 */
 const SERVICE_ORDER: ServiceKey[] = ['input', 'output', 'rag', 'chat']
 
+/** 覆盖本地大模型首次懒加载；服务不可达时连接会立即失败，不会白等满 60 秒。 */
+const PROBE_TIMEOUT_SECONDS = 60
+
 const probing = ref(false)
 const probeResults = ref<Partial<Record<ServiceKey, ServiceProbeResult>> | null>(null)
 
 async function runProbe(): Promise<void> {
   probing.value = true
   try {
-    const report = await testServices()
+    const report = await testServices({
+      timeout: PROBE_TIMEOUT_SECONDS,
+      chat_api_url: settings.chatApiUrl.trim() || undefined,
+      chat_api_key: settings.chatApiKey.trim() || undefined,
+      chat_model: settings.chatModel.trim() || undefined,
+    })
     probeResults.value = report.services
     if (report.ok) ElMessage.success('四个服务均连通')
     else ElMessage.warning('部分服务不可用，详见列表')
@@ -34,6 +42,19 @@ async function runProbe(): Promise<void> {
 function probeOf(key: ServiceKey): ServiceProbeResult | undefined {
   return probeResults.value?.[key]
 }
+
+async function loadChatDefaults(force = false): Promise<void> {
+  try {
+    await settings.ensureChatDefaults(force)
+    if (force) ElMessage.success('已恢复服务端默认聊天配置')
+  } catch (error) {
+    ElMessage.error(`加载聊天默认配置失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+onMounted(() => {
+  void loadChatDefaults()
+})
 
 async function clearAll(): Promise<void> {
   try {
@@ -94,6 +115,45 @@ async function clearAll(): Promise<void> {
         <span class="hint">关闭后以纯文本显示模型回复</span>
       </el-form-item>
 
+      <el-divider content-position="left">聊天模型</el-divider>
+
+      <el-form-item label="API 地址">
+        <el-input
+          v-model="settings.chatApiUrl"
+          placeholder="https://api.openai.com/v1"
+          style="max-width: 460px"
+        />
+        <span class="hint">OpenAI 兼容的 base URL；留空使用后端默认值</span>
+      </el-form-item>
+
+      <el-form-item label="API Key">
+        <el-input
+          v-model="settings.chatApiKey"
+          type="password"
+          show-password
+          autocomplete="off"
+          :placeholder="settings.chatServerKeyConfigured ? '留空使用服务端已配置的 Key' : '输入模型 API Key'"
+          style="max-width: 460px"
+        />
+        <span class="hint">仅保存在当前页面内存，不写 localStorage / 数据库；刷新后需重新输入</span>
+      </el-form-item>
+
+      <el-form-item label="模型名称">
+        <el-input
+          v-model="settings.chatModel"
+          placeholder="例如 gpt-4.1-mini / deepseek-chat"
+          style="max-width: 460px"
+        />
+        <span class="hint">留空使用后端默认模型</span>
+      </el-form-item>
+
+      <el-form-item label="服务端默认">
+        <el-button @click="loadChatDefaults(true)">恢复服务端默认</el-button>
+        <span class="hint">后端 env 只作为默认值，运行中修改 env 需重启后重新载入</span>
+      </el-form-item>
+
+      <el-divider content-position="left">生成参数</el-divider>
+
       <el-form-item label="生成温度">
         <el-slider
           v-model="settings.chatTemperature"
@@ -109,6 +169,53 @@ async function clearAll(): Promise<void> {
       <el-form-item label="最大生成长度">
         <el-input-number v-model="settings.chatMaxTokens" :min="1" :max="32768" :step="256" />
         <span class="hint">单次回复的 token 上限</span>
+      </el-form-item>
+
+      <el-form-item label="Top P">
+        <el-slider
+          v-model="settings.chatTopP"
+          :min="0.05"
+          :max="1"
+          :step="0.05"
+          show-input
+          style="max-width: 320px"
+        />
+        <span class="hint">核采样范围；越低越保守（0.05~1）</span>
+      </el-form-item>
+
+      <el-form-item label="频率惩罚">
+        <el-slider
+          v-model="settings.chatFrequencyPenalty"
+          :min="-2"
+          :max="2"
+          :step="0.1"
+          show-input
+          style="max-width: 320px"
+        />
+        <span class="hint">降低重复用词；本地模型以 repetition penalty 近似实现</span>
+      </el-form-item>
+
+      <el-form-item label="存在惩罚">
+        <el-slider
+          v-model="settings.chatPresencePenalty"
+          :min="-2"
+          :max="2"
+          :step="0.1"
+          show-input
+          style="max-width: 320px"
+        />
+        <span class="hint">鼓励模型讨论新话题；本地模型以 repetition penalty 近似实现</span>
+      </el-form-item>
+
+      <el-form-item label="随机种子">
+        <el-input-number
+          v-model="settings.chatSeed"
+          :min="0"
+          :max="2147483647"
+          :step="1"
+          placeholder="留空表示不固定"
+        />
+        <span class="hint">固定后可提高同参数下输出复现性</span>
       </el-form-item>
 
       <el-form-item label="跳过高置信输出检测">

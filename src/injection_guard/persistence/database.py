@@ -1,19 +1,18 @@
-"""数据库引擎、会话工厂与 FastAPI 依赖（SQLAlchemy 2.0，同步）。
+"""PostgreSQL 引擎、会话工厂与 FastAPI 依赖（SQLAlchemy 2.0，同步）。
 
-默认使用仓库内 SQLite 文件（``DATABASE_URL`` 可切换 PostgreSQL）。引擎按 URL 缓存，
-测试可通过 ``get_database.cache_clear()`` + 环境变量 ``DATABASE_URL`` 覆盖。
+项目只支持 PostgreSQL；``postgresql://`` 会在内部规范到 psycopg v3 驱动。引擎按 URL
+缓存，测试可通过 ``get_database.cache_clear()`` + 环境变量 ``DATABASE_URL`` 覆盖。
 """
 
 from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Iterator
+from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from ..config import get_settings
 from .models import Base
@@ -21,39 +20,30 @@ from .models import Base
 logger = logging.getLogger(__name__)
 
 
-def _is_memory_sqlite(database_url: str) -> bool:
-    return ":memory:" in database_url or database_url.rstrip("/") == "sqlite://"
+def _split_postgres_url(database_url: str) -> tuple[str, str, str, str, str]:
+    parsed = urlsplit(database_url)
+    driver = parsed.scheme.lower()
+    if driver not in {"postgresql", "postgresql+psycopg"}:
+        raise ValueError(
+            "DATABASE_URL 仅支持 PostgreSQL（postgresql:// 或 postgresql+psycopg://）"
+        )
+    return parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment
 
 
-def _prepare_sqlite_path(database_url: str) -> None:
-    """确保 SQLite 文件所在目录存在（否则首次建库会失败）。"""
-    path = database_url[len("sqlite:///") :]
-    if path and path != ":memory:":
-        Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+def sqlalchemy_database_url(database_url: str) -> str:
+    """规范为 SQLAlchemy + psycopg v3 URL；拒绝 PostgreSQL 之外的数据库。"""
+    _, netloc, path, query, fragment = _split_postgres_url(database_url)
+    return urlunsplit(("postgresql+psycopg", netloc, path, query, fragment))
+
+
+def psycopg_database_url(database_url: str) -> str:
+    """规范为 libpq/psycopg 可直接使用的 URL。"""
+    _, netloc, path, query, fragment = _split_postgres_url(database_url)
+    return urlunsplit(("postgresql", netloc, path, query, fragment))
 
 
 def _create_engine(database_url: str) -> Engine:
-    kwargs: Dict[str, Any] = {"pool_pre_ping": True, "future": True}
-    if database_url.startswith("sqlite"):
-        _prepare_sqlite_path(database_url)
-        # FastAPI 在线程池里执行同步依赖，需关闭 SQLite 的线程校验
-        kwargs["connect_args"] = {"check_same_thread": False}
-        if _is_memory_sqlite(database_url):
-            kwargs["poolclass"] = StaticPool  # 内存库：所有连接共享同一实例
-    engine = create_engine(database_url, **kwargs)
-    if database_url.startswith("sqlite"):
-        _enable_sqlite_foreign_keys(engine)
-    return engine
-
-
-def _enable_sqlite_foreign_keys(engine: Engine) -> None:
-    """SQLite 默认不校验外键；显式打开以支持级联删除。"""
-
-    @event.listens_for(engine, "connect")
-    def _set_pragma(dbapi_connection, _connection_record) -> None:  # noqa: ANN001
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    return create_engine(sqlalchemy_database_url(database_url), pool_pre_ping=True, future=True)
 
 
 class Database:

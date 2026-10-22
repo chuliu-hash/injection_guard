@@ -22,6 +22,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,9 +37,10 @@ SENSITIVITY_LEVELS = ("low", "medium", "high")
 # 运行时服务参数文件（绝对路径）：访问/连接项在 .env，各服务的调参/并发/生成参数在此。
 _SERVICES_ENV_FILE = _REPO_ROOT / "configs" / "services.env"
 
-# 会话/消息持久化数据库的默认位置（SQLite 文件，随仓库的 data/ 目录）。
-# 生产可改 DATABASE_URL 指向 PostgreSQL（如 postgresql+psycopg://user:pw@host/db）。
-_DEFAULT_DB_PATH = _REPO_ROOT / "data" / "injection_guard.db"
+# PostgreSQL 是唯一支持的持久化后端；未显式配置时连接本机实例。
+# DSN 未写数据库名时，psycopg/libpq 默认使用与用户名同名的数据库。
+DEFAULT_DATABASE_URL = "postgresql://chuliu:123456@127.0.0.1:5432"
+_POSTGRES_DRIVERS = {"postgresql", "postgresql+psycopg"}
 
 
 class Settings(BaseSettings):
@@ -65,9 +67,8 @@ class Settings(BaseSettings):
     cors_origins: Optional[str] = None
 
     # ── 会话持久化（多用户隔离）──────────────────────────────────────
-    # 会话/消息/检测记录的存储后端。默认 SQLite 文件；生产切 PostgreSQL 只需改此值，
-    # 例如：DATABASE_URL=postgresql+psycopg://user:pw@host:5432/injection_guard
-    database_url: str = f"sqlite:///{_DEFAULT_DB_PATH}"
+    # 会话/消息/检测记录与 LangGraph 检查点共用 PostgreSQL；其他数据库 URL 会在启动时拒绝。
+    database_url: str = DEFAULT_DATABASE_URL
     # 会话标题自动生成的最大长度（取首条用户消息前若干字符）。
     session_title_max_len: int = 20
 
@@ -97,14 +98,12 @@ class Settings(BaseSettings):
     critique_requests_path: Path = _REPO_ROOT / "resources" / "CritiqueRequests.json"
     # BERT 分类模型目录（其下含 4 个子模型），覆盖：BERT_MODEL_DIR
     bert_model_dir: Path = _REPO_ROOT / "models" / "BERT"
-    # RAG 知识库 JSON（每条含 prompt / safe_response），覆盖：RAG_DB_PATH
-    rag_db_path: Path = _REPO_ROOT / "resources" / "jailbreak_prompts.json"
-    # 旧版向量库缓存（自研 torch .pt，与 rag_db_path 同主名），**无需指定**：
-    # 仅用于一次性迁移到下面的 FAISS 索引目录；存在则迁移，不存在则从 rag_db_path 重构。
-    rag_embed_path: Optional[Path] = None
-    # 向量库持久化目录（FAISS 官方 save_local 格式：index.faiss / index.pkl / meta.json），
-    # **无需指定**；留空自动派生为 ``<rag_db_path 同目录>/<主名>_index``。
-    rag_index_dir: Optional[Path] = None
+    # RAG 知识库目录：读取其中所有 JSON（每条含 prompt / safe_response），覆盖：RAG_DIR
+    rag_dir: Path = _REPO_ROOT / "resources" / "rag"
+    # Milvus 集合与本地控制元数据：元数据只记录源 JSON 指纹，向量与文本都在 Milvus。
+    milvus_uri: str = "http://localhost:19530"
+    milvus_collection: str = "injection_guard_rag"
+    rag_meta_path: Optional[Path] = None
 
     # ── 输入检测 ──────────────────────────────────────────────────────
     # 输入检测敏感度（low / medium / high）：**默认值**——请求体 sensitivity 可逐次覆盖
@@ -158,10 +157,14 @@ class Settings(BaseSettings):
     chat_api_key: Optional[str] = None
     chat_model: str = "Qwen3-chat"
     chat_timeout: float = 120.0
-    # 生成参数：**默认值**——随请求由前端设置面板覆盖（请求体 temperature / max_tokens）；
-    # 故不写入 configs/services.env（客户端参数不进配置文件）。
+    # 生成参数：**仅作为默认值**——前端可为每次请求覆盖；进程启动后修改 env 不会影响
+    # 已在运行的 API，需重启后才会成为新的默认值。
     chat_max_tokens: int = 1024
     chat_temperature: float = 0.7
+    chat_top_p: float = 0.9
+    chat_frequency_penalty: float = 0.0
+    chat_presence_penalty: float = 0.0
+    chat_seed: Optional[int] = None
     chat_max_concurrency: Optional[int] = None
     chat_acquire_timeout: float = 120.0
     # 多轮记忆：回灌给聊天的历史轮数（1 轮 = 一问一答，即最多 2N 条消息；0 = 关闭，
@@ -178,7 +181,7 @@ class Settings(BaseSettings):
     # RAG 增强：「请求时」开关的**默认值**（前端设置/请求体 use_rag 覆盖）；不写入 configs/services.env
     enable_rag: bool = False
     rag_top_k: int = 2
-    # 检索结果的最大距离（FAISS 默认欧氏距离，越小越相似）：超过该值的命中丢弃；
+    # 检索结果的最大距离（Milvus L2 距离，越小越相似）：超过该值的命中丢弃；
     # 0 = 不过滤（默认，保持既有行为）。取值需按 embedding 模型的量纲实测标定。
     rag_max_distance: float = 0.0
 
@@ -193,12 +196,22 @@ class Settings(BaseSettings):
     def _normalize_sensitivity(cls, value: str) -> str:
         return value.lower()
 
+    @field_validator("database_url")
+    @classmethod
+    def _require_postgresql(cls, value: str) -> str:
+        """只接受 PostgreSQL，避免部署时静默退回本地文件数据库。"""
+        driver = urlsplit(value).scheme.lower()
+        if driver not in _POSTGRES_DRIVERS:
+            raise ValueError(
+                "DATABASE_URL 仅支持 PostgreSQL "
+                f"（postgresql:// 或 postgresql+psycopg://），当前为 {driver or '空'}"
+            )
+        return value
+
     def model_post_init(self, __context: object) -> None:
-        """补齐派生的路径默认值：旧缓存（.pt）与 FAISS 索引目录都与知识库 JSON 同目录。"""
-        if self.rag_embed_path is None:
-            self.rag_embed_path = self.rag_db_path.with_suffix(".pt")
-        if self.rag_index_dir is None:
-            self.rag_index_dir = self.rag_db_path.parent / f"{self.rag_db_path.stem}_index"
+        """补齐 Milvus 源数据指纹的本地元数据路径。"""
+        if self.rag_meta_path is None:
+            self.rag_meta_path = _REPO_ROOT / "resources" / "rag_milvus.json"
 
 
 @lru_cache(maxsize=1)

@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from ..config import SENSITIVITY_LEVELS, Settings, get_settings
 from ..errors import DetectionError, ServiceBusyError  # noqa: F401  (再导出，供 api/测试沿用)
@@ -29,6 +30,16 @@ logger = logging.getLogger(__name__)
 # LangGraph Agent 惰性构建锁（跨实例共享，避免并发重复编译状态图）
 _AGENT_BUILD_LOCK = threading.Lock()
 
+# 可由请求覆盖的聊天生成参数；transport 参数（URL / Key / Model）单独处理。
+_CHAT_GENERATION_KEYS = (
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "seed",
+)
+
 
 @dataclass
 class DefendOutcome:
@@ -40,6 +51,8 @@ class DefendOutcome:
     output_detection: Optional[Dict[str, Any]]
     model_response: Optional[str] = None
     rag: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None
+    trace: Optional[Dict[str, Any]] = None
 
 
 def validate_defend_request(data: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
@@ -65,6 +78,24 @@ def validate_defend_request(data: Optional[Dict[str, Any]]) -> Tuple[bool, Optio
         if not model_response.strip():
             return False, "model_response 不能为空"
 
+    # 请求级聊天模型配置（可选，前端设置面板提供）
+    chat_api_url = data.get("chat_api_url")
+    if chat_api_url is not None:
+        if not isinstance(chat_api_url, str):
+            return False, "chat_api_url 必须是字符串"
+        if chat_api_url.strip():
+            parsed = urlsplit(chat_api_url.strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return False, "chat_api_url 必须是 http(s) URL"
+
+    chat_api_key = data.get("chat_api_key")
+    if chat_api_key is not None and not isinstance(chat_api_key, str):
+        return False, "chat_api_key 必须是字符串"
+
+    chat_model = data.get("chat_model")
+    if chat_model is not None and not isinstance(chat_model, str):
+        return False, "chat_model 必须是字符串"
+
     # 聊天生成参数（可选，前端设置面板提供）
     temperature = data.get("temperature")
     if temperature is not None:
@@ -77,8 +108,34 @@ def validate_defend_request(data: Optional[Dict[str, Any]]) -> Tuple[bool, Optio
     if max_tokens is not None:
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
             return False, "max_tokens 必须是整数"
-        if max_tokens < 1:
-            return False, "max_tokens 必须 >= 1"
+        if not 1 <= max_tokens <= 32768:
+            return False, "max_tokens 必须在 1~32768 之间"
+
+    top_p = data.get("top_p")
+    if top_p is not None:
+        if isinstance(top_p, bool) or not isinstance(top_p, (int, float)):
+            return False, "top_p 必须是数字"
+        if not 0.0 < float(top_p) <= 1.0:
+            return False, "top_p 必须在 0~1 之间"
+
+    for field, label in (
+        ("frequency_penalty", "frequency_penalty"),
+        ("presence_penalty", "presence_penalty"),
+    ):
+        penalty = data.get(field)
+        if penalty is None:
+            continue
+        if isinstance(penalty, bool) or not isinstance(penalty, (int, float)):
+            return False, f"{label} 必须是数字"
+        if not -2.0 <= float(penalty) <= 2.0:
+            return False, f"{label} 必须在 -2~2 之间"
+
+    seed = data.get("seed")
+    if seed is not None:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            return False, "seed 必须是整数"
+        if not 0 <= seed <= 2**31 - 1:
+            return False, "seed 必须在 0~2147483647 之间"
 
     # 输出检测跳过策略（前端设置面板提供）
     safe_skip_threshold = data.get("safe_skip_threshold")
@@ -141,6 +198,11 @@ class DefenseService:
         self._chat_lock = threading.Lock()
         self._rag_system: Optional[SCR_RAG_System] = None
         self._rag_lock = threading.Lock()
+
+        # LangGraph 检查点（P1）：与会话数据共用 PostgreSQL。
+        from ..agent.checkpointing import build_checkpointer
+
+        self._checkpointer = build_checkpointer(settings)
 
         # 预编译 LangGraph 状态图（一次编译、进程内复用），把 ~1s 的编译耗时
         # 从「首个请求」挪到启动阶段。
@@ -317,18 +379,49 @@ class DefenseService:
             logger.info("[预热] 输出检测器就绪")
             return self._output_detector
 
-    def _get_chat_client(self) -> "ChatClient":
-        """获取常驻聊天客户端（全局一份）。"""
-        if self._chat_client is not None:
-            return self._chat_client
+    def _get_chat_client(self, chat_options: Optional[Dict[str, Any]] = None) -> "ChatClient":
+        """获取聊天客户端；请求带 transport 覆盖时创建一次性客户端。"""
+        options = chat_options or {}
+        configured_url = str(self.settings.chat_api_url or "").strip()
+        requested_url = str(options.get("api_url") or "").strip()
+        configured_model = str(self.settings.chat_model or "").strip()
+        requested_model = str(options.get("model") or "").strip()
 
-        with self._chat_lock:
-            if self._chat_client is None:
-                from ..services.chat_client import ChatClient
+        # 前端初始化后会把服务端默认 URL / 模型原样回传。只有值确实变化时才视为
+        # 请求级覆盖，否则会跳过服务端 .env 中的默认 Key（甚至误发 EMPTY）。
+        custom_api_url = (
+            requested_url
+            if requested_url and requested_url.rstrip("/") != configured_url.rstrip("/")
+            else None
+        )
+        custom_model = requested_model if requested_model and requested_model != configured_model else None
+        api_key = options.get("api_key")
+        if isinstance(api_key, str):
+            api_key = api_key.strip() or None
 
-                self._chat_client = ChatClient()
-                logger.info("[预热] 聊天客户端就绪: base_url=%s", self._chat_client.base_url)
-            return self._chat_client
+        if custom_api_url is None and custom_model is None and api_key is None:
+            if self._chat_client is not None:
+                return self._chat_client
+
+            with self._chat_lock:
+                if self._chat_client is None:
+                    from ..services.chat_client import ChatClient
+
+                    self._chat_client = ChatClient()
+                    logger.info("[预热] 聊天客户端就绪: base_url=%s", self._chat_client.base_url)
+                return self._chat_client
+
+        from ..services.chat_client import ChatClient
+
+        # 自定义服务地址时，未填 Key 不应把服务端默认 Key 发给第三方地址。
+        if custom_api_url is not None and api_key is None:
+            api_key = "EMPTY"
+        logger.info(
+            "[chat] 使用请求级聊天模型: base_url=%s model=%s",
+            custom_api_url or self.settings.chat_api_url,
+            custom_model or self.settings.chat_model,
+        )
+        return ChatClient(base_url=custom_api_url, model_name=custom_model, api_key=api_key)
 
     def _get_rag_system(self) -> "SCR_RAG_System":
         """获取常驻 RAG 系统（全局一份，首次使用时加载知识库）。"""
@@ -495,7 +588,7 @@ class DefenseService:
             "enabled": True,
             "reason": None,
             "final_prompt": final_prompt,
-            # 剔除向量（tensor），只保留可序列化的文本字段
+            # 剔除向量字段，只保留可序列化的文本内容
             "retrieved_contexts": [
                 {"prompt": ctx.get("prompt", ""), "response": ctx.get("response", "")}
                 for ctx in contexts
@@ -505,20 +598,20 @@ class DefenseService:
     def _run_chat(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        """调用普通聊天接口生成回复（生成参数来自请求，留空用 Settings 默认值）。"""
-        return self._get_chat_client().complete(
-            prompt, max_tokens=max_tokens, temperature=temperature, history=history
+        """调用聊天接口生成回复（请求配置优先，留空用 Settings 默认值）。"""
+        options = chat_options or {}
+        generation = {key: options[key] for key in _CHAT_GENERATION_KEYS if options.get(key) is not None}
+        return self._get_chat_client(options).complete(
+            prompt, history=history, **generation
         )
 
     def _run_chat_guarded(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """带并发控制的聊天生成；获取名额超时抛 ``ServiceBusyError``。"""
@@ -526,29 +619,27 @@ class DefenseService:
         if not acquired:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
-            return self._run_chat(
-                prompt, max_tokens=max_tokens, temperature=temperature, history=history
-            )
+            return self._run_chat(prompt, chat_options=chat_options, history=history)
         finally:
             self._chat_sem.release()
 
     def _run_chat_stream(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]:
         """流式调用普通聊天接口，逐段 yield 文本增量。"""
-        yield from self._get_chat_client().stream(
-            prompt, max_tokens=max_tokens, temperature=temperature, history=history
+        options = chat_options or {}
+        generation = {key: options[key] for key in _CHAT_GENERATION_KEYS if options.get(key) is not None}
+        yield from self._get_chat_client(options).stream(
+            prompt, history=history, **generation
         )
 
     def _run_chat_stream_guarded(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]:
         """带并发控制的流式聊天生成；获取名额超时抛 ``ServiceBusyError``。
@@ -560,7 +651,7 @@ class DefenseService:
             raise ServiceBusyError("聊天服务繁忙，请稍后重试")
         try:
             yield from self._run_chat_stream(
-                prompt, max_tokens=max_tokens, temperature=temperature, history=history
+                prompt, chat_options=chat_options, history=history
             )
         finally:
             self._chat_sem.release()
@@ -585,6 +676,20 @@ class DefenseService:
         )
         return enabled, threshold
 
+    @staticmethod
+    def _resolve_chat_options(
+        chat_options: Optional[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """合并请求级聊天配置；结果只通过运行时 config 传递，不进入检查点状态。"""
+        options = dict(chat_options or {})
+        if temperature is not None:
+            options["temperature"] = temperature
+        if max_tokens is not None:
+            options["max_tokens"] = max_tokens
+        return {key: value for key, value in options.items() if value is not None}
+
     def _get_agent(self) -> "DefenseAgent":
         """惰性构建并缓存 LangGraph Agent。
 
@@ -598,7 +703,7 @@ class DefenseService:
                 if agent is None:
                     from ..agent.pipeline import DefenseAgent
 
-                    agent = DefenseAgent(self)
+                    agent = DefenseAgent(self, checkpointer=getattr(self, "_checkpointer", None))
                     self._agent = agent
         return agent
 
@@ -623,8 +728,6 @@ class DefenseService:
             "detector_api_key": kwargs.get("detector_api_key"),
             "detector_api_url": kwargs.get("detector_api_url"),
             "detector_model_name": kwargs.get("detector_model_name"),
-            "temperature": kwargs.get("temperature"),
-            "max_tokens": kwargs.get("max_tokens"),
             "skip_output_when_high_confidence": skip_hc,
             "safe_skip_threshold": skip_threshold,
             # 流式增量输出检测间隔（token 估算值，0=关闭）；配置项，请求体不覆盖
@@ -647,6 +750,8 @@ class DefenseService:
         detector_api_key: Optional[str] = None,
         detector_api_url: Optional[str] = None,
         detector_model_name: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         safe_skip_threshold: Optional[float] = None,
@@ -666,6 +771,7 @@ class DefenseService:
         ``model_response`` 时那是"待检测的文本"，替换会破坏纯检测用法；流式路径下
         文本也已发出、无从撤回。是否拦截展示由前端按 ``stopped_at`` 决定。
         """
+        resolved_chat_options = self._resolve_chat_options(chat_options, temperature, max_tokens)
         state = self._build_pipeline_state(
             stream=False,
             user_input=user_input,
@@ -680,13 +786,13 @@ class DefenseService:
             detector_api_key=detector_api_key,
             detector_api_url=detector_api_url,
             detector_model_name=detector_model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
             safe_skip_threshold=safe_skip_threshold,
             skip_output_when_high_confidence=skip_output_when_high_confidence,
         )
         try:
-            final = self._get_agent().run(state)
+            final = self._get_agent().run(
+                state, thread_id=thread_id, chat_options=resolved_chat_options
+            )
         except ServiceBusyError:
             logger.warning("[503] 流水线并发名额获取超时")
             raise
@@ -698,6 +804,8 @@ class DefenseService:
             output_detection=final.get("output_detection"),
             model_response=final.get("model_response"),
             rag=final.get("rag"),
+            thread_id=final.get("thread_id"),
+            trace=final.get("trace"),
         )
 
     def stream_detect(
@@ -715,6 +823,8 @@ class DefenseService:
         detector_api_key: Optional[str] = None,
         detector_api_url: Optional[str] = None,
         detector_model_name: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         safe_skip_threshold: Optional[float] = None,
@@ -731,6 +841,7 @@ class DefenseService:
         发出，**服务端无法撤回**，故由前端在收到 ``output_detection`` 事件后立即用拦截
         文案替换气泡内容（这就是"先流式、结果出来再替换"的实现方式）。
         """
+        resolved_chat_options = self._resolve_chat_options(chat_options, temperature, max_tokens)
         state = self._build_pipeline_state(
             stream=True,
             user_input=user_input,
@@ -745,14 +856,19 @@ class DefenseService:
             detector_api_key=detector_api_key,
             detector_api_url=detector_api_url,
             detector_model_name=detector_model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
             safe_skip_threshold=safe_skip_threshold,
             skip_output_when_high_confidence=skip_output_when_high_confidence,
         )
 
         cancel_event = threading.Event()
-        events = iter(self._get_agent().stream(state, cancel_event=cancel_event))
+        events = iter(
+            self._get_agent().stream(
+                state,
+                cancel_event=cancel_event,
+                thread_id=thread_id,
+                chat_options=resolved_chat_options,
+            )
+        )
         try:
             while True:
                 try:

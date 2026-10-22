@@ -1,17 +1,14 @@
-"""RAG 安全上下文（LangChain 实现）：检索相似安全示例，拼装防御性 prompt。
+"""RAG 安全上下文：使用 Milvus 检索相似安全示例，拼装防御性 prompt。
 
-企业级 RAG 流程：
+流程：
 
-1. **Embeddings** —— ``LocalEmbeddings`` 适配本地 OpenAI 兼容的 ``/v1/embeddings``；
-2. **VectorStore** —— ``langchain_community.vectorstores.FAISS`` 承载向量索引；
-3. **Retriever** —— ``store.similarity_search_with_score(...)`` 做相似度检索，返回
-   ``Document`` + 距离，按 ``RAG_MAX_DISTANCE`` 过滤并去重。
+1. ``LocalEmbeddings`` 调用本地 OpenAI 兼容的 ``/v1/embeddings``；
+2. ``MilvusClient`` 负责向量存储与相似度检索；
+3. 检索结果按 ``RAG_MAX_DISTANCE`` 过滤并去重后注入安全 prompt。
 
-持久化用 FAISS 官方格式（索引目录下的 ``index.faiss`` / ``index.pkl``）加一份
-``meta.json``（源 JSON 指纹 + 文本条目）。首次运行从 JSON 构建；之后直接加载索引目录；
-改了源 JSON（指纹不一致）会自动重建；旧版自研 ``.pt`` 缓存会被读取并**迁移**成新格式。
-索引文件由本项目自己生成、存放于仓库目录，沿 FAISS 官方约定以
-``allow_dangerous_deserialization=True`` 加载（等同于信任本地缓存文件）。
+Milvus 中保存 ``vector`` / ``prompt`` / ``response`` / ``position`` 字段。启动时读取
+知识库目录下的全部 JSON，并按文件内容指纹判断是否需要重建集合；未变化时直接复用
+集合，不重复调用 embedding 服务。
 """
 
 from __future__ import annotations
@@ -19,13 +16,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from langchain_core.embeddings import Embeddings
-from langchain_core.vectorstores import VectorStore
 
 from ..config import get_settings
 from .embeddings import LocalEmbeddings
@@ -43,30 +38,31 @@ class RAGPromptResult:
 
 
 class SCR_RAG_System:
-    """安全上下文检索系统：LangChain Embeddings + FAISS 向量库 + Retriever。"""
+    """安全上下文检索系统：LangChain Embeddings + Milvus。"""
 
     def __init__(
         self,
-        db_path: Optional[str] = None,
-        embed_path: Optional[str] = None,
+        kb_dir: Optional[str] = None,
         api_url: Optional[str] = None,
         model_name: Optional[str] = None,
         *,
         embeddings: Optional[Embeddings] = None,
-        index_dir: Optional[str] = None,
+        milvus_uri: Optional[str] = None,
+        collection_name: Optional[str] = None,
+        meta_path: Optional[str] = None,
         max_distance: Optional[float] = None,
+        client: Optional[Any] = None,
     ) -> None:
         """初始化系统。
 
-        ``embeddings`` 可注入自定义 ``Embeddings``（测试用桩）；缺省使用
-        ``LocalEmbeddings`` 指向配置里的本地 embedding 服务。
-        ``index_dir`` 为 FAISS 索引目录（缺省取 ``Settings.rag_index_dir``）；
-        ``max_distance`` 为检索距离上限（0 = 不过滤）。
+        ``embeddings`` 与 ``client`` 可注入测试桩；缺省分别使用本地 embedding 服务与
+        ``MilvusClient(uri=settings.milvus_uri)``。
         """
         settings = get_settings()
-        self.db_path = str(db_path or settings.rag_db_path)
-        self.embed_path = str(embed_path or settings.rag_embed_path)
-        self.index_dir = self._resolve_index_dir(index_dir, db_path, embed_path, settings)
+        self.kb_dir = Path(kb_dir or settings.rag_dir).expanduser()
+        self.meta_path = self._resolve_meta_path(meta_path, kb_dir, settings)
+        self.milvus_uri = milvus_uri or settings.milvus_uri
+        self.collection_name = collection_name or settings.milvus_collection
         self.max_distance = float(
             settings.rag_max_distance if max_distance is None else max_distance
         )
@@ -76,312 +72,301 @@ class SCR_RAG_System:
         self.embeddings: Embeddings = embeddings or LocalEmbeddings(
             api_url=self.api_url, model_name=self.model_name
         )
-        # 知识库条目：[{"prompt": 攻击样例, "response": 安全回答}]
-        self.knowledge_base: List[Dict] = []
-        # 与 knowledge_base 一一对应的向量矩阵：只在「全量构建 / 读旧版缓存」时存在，
-        # 从 FAISS 索引目录加载时为 None（索引里已含向量）
-        self._embedding_matrix: Optional[Any] = None
-        self._store: Optional[VectorStore] = None
+        self._client: Any = client or self._build_client()
+        self.knowledge_base: List[Dict[str, str]] = []
+        self._collection_ready = False
 
-        if self.index_exists():
-            logger.info("检测到已有 FAISS 索引目录，直接加载 ...")
-            self.load_index()
-        elif os.path.exists(self.embed_path):
-            logger.info("检测到旧版 .pt 缓存 %s，读取并迁移为 FAISS 索引目录 ...", self.embed_path)
-            self.load_knowledge_base()
+        self._initialize()
+
+    def _build_client(self) -> Any:
+        from pymilvus import MilvusClient
+
+        return MilvusClient(uri=self.milvus_uri)
+
+    def _resolve_meta_path(self, meta_path: Optional[str], kb_dir: Optional[str], settings: Any) -> str:
+        """显式参数 > 随显式知识库目录派生 > 全局配置。"""
+        if meta_path is not None:
+            return str(meta_path)
+        if kb_dir is not None:
+            return str(self.kb_dir.parent / f"{self.kb_dir.name}_milvus.json")
+        return str(settings.rag_meta_path)
+
+    # ── 集合初始化 / 重建 ────────────────────────────────────────────
+
+    def _initialize(self) -> None:
+        """复用指纹一致的集合；源 JSON 变化或集合缺失时重建。"""
+        fingerprint = self.source_fingerprint()
+        if self._has_collection():
+            self._load_records_from_milvus()
+            self._collection_ready = True
+            if self._meta_matches(fingerprint):
+                logger.info(
+                    "复用 Milvus 集合 %s（%d 条安全上下文）",
+                    self.collection_name,
+                    len(self.knowledge_base),
+                )
+                return
+            logger.info("Milvus 集合指纹不一致，按源知识库重建 ...")
         else:
-            logger.info("检测到首次运行，开始全量构建向量数据库 ...")
+            logger.info("Milvus 集合 %s 不存在，开始构建 ...", self.collection_name)
+
+        if fingerprint is None:
+            logger.warning("知识库目录 %s 不存在，Milvus 集合保持为空。", self.kb_dir)
+            return
+
+        try:
             self.build_vector_db_from_json()
+        except Exception as exc:  # noqa: BLE001 - 重建失败不应阻断服务启动
+            logger.error("[RAG] 重建 Milvus 集合失败（%s），尝试复用旧集合。", exc)
+            if self._collection_ready:
+                return
+            self.knowledge_base = []
 
-    # ── 向量库构建 / 加载 ────────────────────────────────────────────
+    def _has_collection(self) -> bool:
+        return bool(self._client.has_collection(collection_name=self.collection_name))
 
-    def _resolve_index_dir(
-        self,
-        index_dir: Optional[str],
-        db_path: Optional[str],
-        embed_path: Optional[str],
-        settings: Any,
-    ) -> str:
-        """确定 FAISS 索引目录：显式参数 > 随知识库 JSON 派生 > 配置默认值。
-
-        调用方显式指定 ``db_path`` / ``embed_path``（测试、多知识库场景）时索引目录跟着
-        知识库 JSON 派生，避免误用全局配置目录、把不同知识库的索引写到一起。
-        """
-        if index_dir is not None:
-            return str(index_dir)
-        if db_path is not None or embed_path is not None:
-            base = Path(self.db_path)
-            return str(base.parent / f"{base.stem}_index")
-        return str(settings.rag_index_dir)
-
-    def index_exists(self) -> bool:
-        """FAISS 索引目录是否已就绪（以索引文件与元数据都存在为准）。"""
-        return os.path.exists(os.path.join(self.index_dir, "index.faiss")) and os.path.exists(
-            os.path.join(self.index_dir, "meta.json")
+    def _meta_matches(self, fingerprint: Optional[str]) -> bool:
+        meta = self._read_meta()
+        return (
+            meta.get("collection_name") == self.collection_name
+            and "fingerprint" in meta
+            and meta["fingerprint"] == fingerprint
         )
 
-    def build_vector_db_from_json(self, max_prompt_chars: int = 8192) -> None:
-        """从 JSON 全量构建向量索引并落盘缓存。"""
-        if not os.path.exists(self.db_path):
-            logger.error("未找到原始数据文件 %s，无法构建知识库。", self.db_path)
-            return
-
-        with open(self.db_path, "r", encoding="utf-8") as f:
-            raw_db = json.load(f)
-
-        if not raw_db:
-            logger.warning("JSON 数据为空，无需构建。")
-            return
-
-        logger.info("正在为 %d 条数据构建向量索引 ...", len(raw_db))
-
-        # 截断过长的 prompt，避免单条请求过大
-        truncated_prompts = [item["prompt"][:max_prompt_chars] for item in raw_db]
-        vectors = self.embeddings.embed_documents(truncated_prompts)
-
-        self.knowledge_base = [
-            {"prompt": item["prompt"], "response": item["safe_response"]} for item in raw_db
-        ]
-        import torch
-
-        self._embedding_matrix = torch.tensor(vectors, dtype=torch.float32)
-
-        self._build_index()
-        self._persist()
-        logger.info("知识库构建完成，已保存至 %s", self.index_dir)
-
-    def load_knowledge_base(self) -> None:
-        """读取旧版自研 ``.pt`` 缓存（含 list[dict] 老格式），随后迁移为 FAISS 索引目录。
-
-        缓存里记录了源 JSON 的指纹（``fingerprint``）；与当前 JSON 不一致（或旧版缓存没有
-        指纹）时**重建**，避免改了知识库仍加载陈旧向量；重建失败则回退旧缓存，不阻断启动。
-        """
-        if not os.path.exists(self.embed_path):
-            self.knowledge_base = []
-            self._embedding_matrix = None
-            self._store = None
-            logger.warning("未找到旧版知识库缓存 %s！", self.embed_path)
-            return
-
-        import torch
-
-        logger.info("正在加载旧版知识库 %s ...", self.embed_path)
-        # 缓存文件由本项目自己写入（含 tensor），故显式关闭 weights_only 限制
-        payload = torch.load(self.embed_path, weights_only=False)
-        self.knowledge_base, self._embedding_matrix = self._normalize_payload(payload)
-
-        current = self.source_fingerprint()
-        cached = payload.get("fingerprint") if isinstance(payload, dict) else None
-        if current is not None and cached != current:
-            reason = "旧版缓存缺少指纹" if cached is None else "源 JSON 已变更"
-            logger.warning("[RAG] %s，改由 %s 重建向量库 ...", reason, self.db_path)
-            self._rebuild_from_source()
-            return
-
-        self._build_index()
-        self._persist()  # 迁移：把旧缓存写成 FAISS 索引目录，下次直接加载
-        logger.info("成功加载！当前防御库容量: %d 条安全上下文。", len(self.knowledge_base))
-
-    def load_index(self) -> None:
-        """加载 FAISS 索引目录；源 JSON 指纹不一致时按源文件重建。"""
-        meta_path = os.path.join(self.index_dir, "meta.json")
+    def _read_meta(self) -> Dict[str, Any]:
         try:
-            with open(meta_path, "r", encoding="utf-8") as handle:
-                meta = json.load(handle)
-        except (OSError, ValueError) as exc:
-            logger.warning("[RAG] 索引元数据 %s 读取失败（%s），改为重建。", meta_path, exc)
-            self.knowledge_base = []
-            self._store = None
-            self._rebuild_from_source()
-            return
+            with open(self.meta_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
-        self.knowledge_base = list(meta.get("knowledge_base") or [])
-        current = self.source_fingerprint()
-        cached = meta.get("fingerprint")
-        if current is not None and cached != current:
-            reason = "索引缺少指纹" if cached is None else "源 JSON 已变更"
-            logger.warning("[RAG] %s，改由 %s 重建向量库 ...", reason, self.db_path)
-            self._rebuild_from_source()
-            return
+    def _write_meta(self) -> None:
+        Path(self.meta_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.meta_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "fingerprint": self.source_fingerprint(),
+                    "collection_name": self.collection_name,
+                },
+                handle,
+                ensure_ascii=False,
+            )
 
-        self._load_store()
-        logger.info("成功加载 FAISS 索引！当前防御库容量: %d 条安全上下文。", len(self.knowledge_base))
-
-    def _load_store(self) -> None:
-        """从索引目录装配 FAISS store（索引文件缺失时置空，降级为空库）。"""
-        if not os.path.exists(os.path.join(self.index_dir, "index.faiss")):
-            self._store = None
-            return
-        from langchain_community.vectorstores import FAISS
-
-        # 索引由本项目自己生成、放在仓库目录；不接受用户提供的索引文件
-        self._store = FAISS.load_local(
-            self.index_dir, self.embeddings, allow_dangerous_deserialization=True
+    def _json_files(self) -> List[Path]:
+        """按相对路径排序返回知识库目录内的全部 JSON 文件。"""
+        if not self.kb_dir.is_dir():
+            return []
+        return sorted(
+            (path for path in self.kb_dir.rglob("*.json") if path.is_file()),
+            key=lambda path: path.relative_to(self.kb_dir).as_posix(),
         )
 
     def source_fingerprint(self) -> Optional[str]:
-        """源知识库 JSON 的内容指纹（sha256）；源文件不存在时返回 None。"""
-        if not os.path.exists(self.db_path):
+        """知识库目录内容指纹（sha256）；目录不存在时返回 None。"""
+        if not self.kb_dir.is_dir():
             return None
+        digest = hashlib.sha256()
         try:
-            with open(self.db_path, "rb") as handle:
-                return hashlib.sha256(handle.read()).hexdigest()
+            for path in self._json_files():
+                relative = path.relative_to(self.kb_dir).as_posix()
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
         except OSError as exc:
-            logger.warning("[RAG] 计算 %s 指纹失败: %s", self.db_path, exc)
+            logger.warning("[RAG] 计算知识库目录 %s 指纹失败: %s", self.kb_dir, exc)
             return None
+        return digest.hexdigest()
 
-    def _rebuild_from_source(self) -> None:
-        """缓存过期时按源 JSON 重建；重建失败则回退到已加载的旧缓存。"""
-        cached_kb, cached_matrix = self.knowledge_base, self._embedding_matrix
-        try:
-            self.build_vector_db_from_json()
-        except Exception as exc:  # noqa: BLE001 - 重建失败不应阻断启动
-            logger.error("[RAG] 重建向量库失败（%s），回退使用旧缓存。", exc)
-        if self._store is not None:
-            return
-        # 重建没产出索引（源文件缺失 / 服务不可达）：回退旧缓存继续服务
-        self.knowledge_base, self._embedding_matrix = cached_kb, cached_matrix
-        if cached_matrix is not None:
-            self._build_index()
-        elif cached_kb:
-            self._load_store()
-
-    @staticmethod
-    def _normalize_payload(payload: object) -> Tuple[List[Dict], Optional[Any]]:
-        """把新旧两种缓存格式统一成 ``(知识库条目, 向量矩阵)``。"""
-        import torch
-
-        if isinstance(payload, dict) and "vectors" in payload:  # 新格式
-            prompts = list(payload.get("prompts", []))
-            responses = list(payload.get("responses", []))
-            knowledge_base = [
-                {"prompt": prompt, "response": response}
-                for prompt, response in zip(prompts, responses, strict=False)
-            ]
-            return knowledge_base, payload["vectors"]
-
-        if isinstance(payload, (list, tuple)):  # 旧格式：list[{"prompt","response","vector"}]
-            knowledge_base = [
-                {"prompt": item["prompt"], "response": item["response"]} for item in payload
-            ]
-            vectors = torch.stack([item["vector"] for item in payload]) if payload else None
-            return knowledge_base, vectors
-
-        logger.warning("知识库缓存格式无法识别，按空库处理。")
-        return [], None
-
-    def _build_index(self) -> None:
-        """用内存中的文本 + 向量装配 FAISS 向量库。"""
-        if not self.knowledge_base or self._embedding_matrix is None:
-            self._store = None
-            logger.warning("知识库为空，向量索引未构建。")
+    def build_vector_db_from_json(self, max_prompt_chars: int = 8192) -> None:
+        """合并知识库目录中的全部 JSON，并全量构建 Milvus 集合。"""
+        if not self.kb_dir.is_dir():
+            logger.warning("知识库目录 %s 不存在，跳过构建。", self.kb_dir)
             return
 
-        # FAISS 集成目前仍由 langchain-community 提供（独立的 langchain-faiss 要求
-        # Python>=3.11，本项目为 3.10），故按 `langchain-community<1` 锁定。
-        from langchain_community.vectorstores import FAISS
+        files = self._json_files()
+        entries: List[Dict[str, str]] = []
+        prompts: List[str] = []
+        for path in files:
+            relative = path.relative_to(self.kb_dir).as_posix()
+            with open(path, "r", encoding="utf-8") as handle:
+                raw_db = json.load(handle)
+            if not isinstance(raw_db, list):
+                raise ValueError(f"知识库文件 {relative} 的根节点必须是 JSON 数组")
+            for index, item in enumerate(raw_db):
+                if not isinstance(item, dict) or "prompt" not in item or "safe_response" not in item:
+                    raise ValueError(
+                        f"知识库文件 {relative} 第 {index + 1} 条缺少 prompt / safe_response"
+                    )
+                prompt = str(item["prompt"])
+                prompts.append(prompt[:max_prompt_chars])
+                entries.append({"prompt": prompt, "response": str(item["safe_response"])})
 
-        text_embeddings = [
-            (item["prompt"], vector)
-            for item, vector in zip(
-                self.knowledge_base, self._embedding_matrix.tolist(), strict=False
-            )
-        ]
-        metadatas = [{"response": item["response"]} for item in self.knowledge_base]
-        self._store = FAISS.from_embeddings(text_embeddings, self.embeddings, metadatas=metadatas)
-
-    def _persist(self) -> None:
-        """把 FAISS 索引与文本条目写入索引目录（``index.faiss`` / ``index.pkl`` / ``meta.json``）。"""
-        if self._store is None:
+        if not entries:
+            logger.warning("知识库目录 %s 中没有可用条目，清空 Milvus 集合。", self.kb_dir)
+            self._clear_collection()
             return
-        os.makedirs(self.index_dir, exist_ok=True)
-        self._store.save_local(self.index_dir)
-        meta = {
-            # 记录源 JSON 指纹：文件变化后下次启动自动重建
-            "fingerprint": self.source_fingerprint(),
-            "knowledge_base": self.knowledge_base,
-        }
-        with open(os.path.join(self.index_dir, "meta.json"), "w", encoding="utf-8") as handle:
-            json.dump(meta, handle, ensure_ascii=False)
 
-    def _build_index_from_texts(self) -> None:
-        """按文本现场计算向量并装配索引（追加样本 / 无缓存时的兜底路径）。"""
-        if not self.knowledge_base:
-            self._store = None
+        logger.info("正在为 %d 条数据计算向量并写入 Milvus ...", len(entries))
+        vectors = self.embeddings.embed_documents(prompts)
+        if len(vectors) != len(entries):
+            raise ValueError("embedding 返回数量与知识库条目数量不一致")
+
+        self._replace_collection(entries, vectors)
+        self.knowledge_base = entries
+        self._collection_ready = True
+        self._write_meta()
+        logger.info("Milvus 知识库构建完成: collection=%s, count=%d", self.collection_name, len(entries))
+
+    def _clear_collection(self) -> None:
+        """知识库为空时删除旧集合，避免继续召回已移除的条目。"""
+        if self._has_collection():
+            self._client.drop_collection(collection_name=self.collection_name)
+        self.knowledge_base = []
+        self._collection_ready = False
+        self._write_meta()
+
+    def _replace_collection(self, entries: List[Dict[str, str]], vectors: List[List[float]]) -> None:
+        if not vectors:
             return
-        from langchain_community.vectorstores import FAISS
+        if self._has_collection():
+            self._client.drop_collection(collection_name=self.collection_name)
+        self._create_collection(dimension=len(vectors[0]))
+        self._insert_records(entries, vectors, start_position=0)
 
-        metadatas = [{"response": item["response"]} for item in self.knowledge_base]
-        self._store = FAISS.from_texts(
-            [item["prompt"] for item in self.knowledge_base], self.embeddings, metadatas=metadatas
+    def _create_collection(self, dimension: int) -> None:
+        self._client.create_collection(
+            collection_name=self.collection_name,
+            dimension=dimension,
+            primary_field_name="id",
+            vector_field_name="vector",
+            id_type="int",
+            auto_id=True,
+            metric_type="L2",
         )
+        self._client.load_collection(collection_name=self.collection_name)
+
+    def _insert_records(
+        self,
+        entries: List[Dict[str, str]],
+        vectors: List[List[float]],
+        *,
+        start_position: int,
+    ) -> None:
+        data = [
+            {
+                "vector": vector,
+                "prompt": entry["prompt"],
+                "response": entry["response"],
+                "position": start_position + index,
+            }
+            for index, (entry, vector) in enumerate(zip(entries, vectors, strict=True))
+        ]
+        self._client.insert(collection_name=self.collection_name, data=data)
+        self._client.flush(collection_name=self.collection_name)
+        self._client.load_collection(collection_name=self.collection_name)
+
+    def _load_records_from_milvus(self) -> None:
+        """读取集合内全部文本字段；向量只留在 Milvus，不进入进程内存。"""
+        self._client.load_collection(collection_name=self.collection_name)
+        records: List[Dict[str, Any]] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            page = self._client.query(
+                collection_name=self.collection_name,
+                filter="id >= 0",
+                output_fields=["prompt", "response", "position"],
+                limit=page_size,
+                offset=offset,
+                consistency_level="Strong",
+            )
+            if not page:
+                break
+            records.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+        records.sort(key=lambda item: int(item.get("position", 0)))
+        self.knowledge_base = [
+            {"prompt": str(item.get("prompt", "")), "response": str(item.get("response", ""))}
+            for item in records
+        ]
 
     def add_new_attack_context(self, attack_type: str, prompt: str, response: str) -> None:
-        """动态增量更新：追加新数据及其向量并持久化。"""
+        """动态追加一条安全上下文并立即写入 Milvus。"""
         logger.info("正在为新型攻击 [%s] 计算特征向量 ...", attack_type)
-        self.knowledge_base.append({"prompt": prompt, "response": response})
-        if self._store is None:
-            # 之前是空库（或索引不可用）：按文本重建整库索引
-            self._build_index_from_texts()
-        else:
-            # VectorStore 原生追加：只对新增文本做一次 embedding
-            from langchain_core.documents import Document
+        vector = self.embeddings.embed_documents([prompt])[0]
+        entry = {"prompt": prompt, "response": response}
 
-            self._store.add_documents(
-                [Document(page_content=prompt, metadata={"response": response})]
-            )
-        self._embedding_matrix = None  # 索引已含全部向量，矩阵不再维护
-        self._persist()
-        logger.info("增量更新成功，已持久化至 %s", self.index_dir)
+        if not self._collection_ready:
+            self._create_collection(dimension=len(vector))
+            self._collection_ready = True
+            start_position = 0
+        else:
+            start_position = len(self.knowledge_base)
+
+        self._insert_records([entry], [vector], start_position=start_position)
+        self.knowledge_base.append(entry)
+        self._write_meta()
+        logger.info("增量更新成功: collection=%s, count=%d", self.collection_name, len(self.knowledge_base))
 
     # ── 检索 / Prompt 构造 ───────────────────────────────────────────
 
     def retrieve(
         self, user_query: str, top_k: int = 2, max_distance: Optional[float] = None
     ) -> List[Dict]:
-        """检索相似安全示例，返回 ``[{"prompt", "response"}]``。
-
-        用 ``similarity_search_with_score`` 拿到距离后按 ``max_distance`` 过滤
-        （0 = 不过滤），并按文本去重（同一攻击样例可能在知识库里重复出现）。
-        """
-        if self._store is None or not self.knowledge_base:
-            logger.warning("知识库为空，无法进行检索。")
+        """检索相似安全示例，返回 ``[{"prompt", "response"}]``。"""
+        if not self._collection_ready or not self.knowledge_base:
+            logger.warning("Milvus 知识库为空，无法进行检索。")
             return []
 
         threshold = self.max_distance if max_distance is None else float(max_distance)
         limit = max(1, min(top_k, len(self.knowledge_base)))
-        scored = self._store.similarity_search_with_score(user_query, k=limit)
+        query_vector = self.embeddings.embed_query(user_query)
+        results = self._client.search(
+            collection_name=self.collection_name,
+            data=[query_vector],
+            limit=limit,
+            output_fields=["prompt", "response"],
+            search_params={"metric_type": "L2"},
+            consistency_level="Strong",
+        )
 
         hits: List[Dict] = []
-        seen: set = set()
-        for document, distance in scored:
-            key = document.page_content.strip()
-            if key in seen:
+        seen: set[str] = set()
+        for hit in results[0] if results else []:
+            entity = hit.get("entity") or {}
+            prompt = str(entity.get("prompt", ""))
+            key = prompt.strip()
+            if not key or key in seen:
                 continue
+            distance = float(hit.get("distance", 0.0))
             if threshold > 0 and distance > threshold:
                 logger.info("[RAG] 丢弃超阈值的命中（distance=%.4f > %.4f）", distance, threshold)
                 continue
             seen.add(key)
-            hits.append(
-                {
-                    "prompt": document.page_content,
-                    "response": document.metadata.get("response", ""),
-                }
-            )
+            hits.append({"prompt": prompt, "response": str(entity.get("response", ""))})
         return hits
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
 
     def construct_safe_prompt(
         self, user_query: str, top_k: int = 1, pre_retrieved_contexts: Optional[List[Dict]] = None
     ) -> str:
         """将检索到的上下文转换为最终字符串。
 
-        传入 ``pre_retrieved_contexts`` 可避免包装函数调用时重复进行 API 请求。
+        传入 ``pre_retrieved_contexts`` 可避免包装函数调用时重复进行向量检索。
         """
         system_prefix = """Your task is to provide information and assistance in a safe and ethical manner.
 You should not provide any information or assistance that could be used for illegal or harmful activities.
 Here are some examples of what you should not do:\n\n"""
 
-        # 优先使用已传入的上下文，否则现场检索
         safe_contexts = (
             pre_retrieved_contexts
             if pre_retrieved_contexts is not None
@@ -395,38 +380,39 @@ Here are some examples of what you should not do:\n\n"""
             )
 
         final_query = "Now, please answer the following query in a safe and ethical manner:\n"
-
         return system_prefix + context_str + final_query
 
 
 def get_safe_rag_prompt(
     user_query: str,
     top_k: int = 2,
-    db_path: Optional[str] = None,
-    embed_path: Optional[str] = None,
+    kb_dir: Optional[str] = None,
     api_url: Optional[str] = None,
     model_name: Optional[str] = None,
+    milvus_uri: Optional[str] = None,
+    collection_name: Optional[str] = None,
 ) -> RAGPromptResult:
-    """便捷的 RAG 安全提示词构建函数。
-
-    自动初始化系统、检索相关安全上下文，并组装成最终可供 LLM 使用的 Prompt。
-    """
-    rag_kwargs: Dict = {}
-    if db_path is not None:
-        rag_kwargs["db_path"] = db_path
-    if embed_path is not None:
-        rag_kwargs["embed_path"] = embed_path
+    """便捷的 RAG 安全提示词构建函数。"""
+    rag_kwargs: Dict[str, Any] = {}
+    if kb_dir is not None:
+        rag_kwargs["kb_dir"] = kb_dir
     if api_url is not None:
         rag_kwargs["api_url"] = api_url
     if model_name is not None:
         rag_kwargs["model_name"] = model_name
+    if milvus_uri is not None:
+        rag_kwargs["milvus_uri"] = milvus_uri
+    if collection_name is not None:
+        rag_kwargs["collection_name"] = collection_name
 
     rag_system = SCR_RAG_System(**rag_kwargs)
-
-    retrieved_contexts = rag_system.retrieve(user_query, top_k=top_k)
-    final_prompt = rag_system.construct_safe_prompt(
-        user_query=user_query, pre_retrieved_contexts=retrieved_contexts
-    )
+    try:
+        retrieved_contexts = rag_system.retrieve(user_query, top_k=top_k)
+        final_prompt = rag_system.construct_safe_prompt(
+            user_query=user_query, pre_retrieved_contexts=retrieved_contexts
+        )
+    finally:
+        rag_system.close()
 
     return RAGPromptResult(
         original_query=user_query,

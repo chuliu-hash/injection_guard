@@ -1,4 +1,4 @@
-"""JWT 登录鉴权测试：注册 / 登录 / 刷新 / 退出 / 鉴权保护（临时 SQLite，不依赖 GPU）。"""
+"""JWT 登录鉴权测试：注册 / 登录 / 刷新 / 退出 / 鉴权保护（临时 PostgreSQL schema，不依赖 GPU）。"""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from injection_guard.persistence.database import get_database
 USER = {"username": "alice", "password": "s3cret-pass"}
 
 
-def _client(tmp_path, monkeypatch, **env) -> TestClient:
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'auth.db'}")
+def _client(postgres_database_url, monkeypatch, **env) -> TestClient:
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -23,11 +23,9 @@ def _client(tmp_path, monkeypatch, **env) -> TestClient:
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    with _client(tmp_path, monkeypatch) as test_client:
+def client(postgres_database_url, monkeypatch):
+    with _client(postgres_database_url, monkeypatch) as test_client:
         yield test_client
-    get_settings.cache_clear()
-    get_database.cache_clear()
 
 
 def test_register_login_and_me(client: TestClient) -> None:
@@ -110,8 +108,6 @@ def test_logout_all_devices_revokes_existing_tokens(client: TestClient) -> None:
     assert client.get("/api/auth/me", headers=headers).status_code == 401
 
 
-def test_registration_can_be_disabled(tmp_path, monkeypatch) -> None:
-    with _client(tmp_path, monkeypatch, ALLOW_REGISTRATION="false") as test_client:
+def test_registration_can_be_disabled(postgres_database_url, monkeypatch) -> None:
+    with _client(postgres_database_url, monkeypatch, ALLOW_REGISTRATION="false") as test_client:
         assert test_client.post("/api/auth/register", json=USER).status_code == 403
-    get_settings.cache_clear()
-    get_database.cache_clear()

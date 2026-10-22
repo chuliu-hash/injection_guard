@@ -52,8 +52,6 @@ class PipelineState(TypedDict, total=False):
     detector_api_key: Optional[str]
     detector_api_url: Optional[str]
     detector_model_name: Optional[str]
-    temperature: Optional[float]
-    max_tokens: Optional[int]
     skip_output_when_high_confidence: bool
     safe_skip_threshold: float
     # 流式增量输出检测间隔（token 估算值；0 = 关闭，只做生成结束后的整段检测）

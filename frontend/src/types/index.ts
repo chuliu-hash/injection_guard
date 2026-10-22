@@ -102,12 +102,33 @@ export interface ChatStreamRequest {
   /** 输入检测敏感度（设置面板提供；缺省由后端的 DEFAULT_SENSITIVITY 决定）。 */
   sensitivity?: SensitivityLevel
   model_response?: string
+  /** 请求级聊天模型配置；留空字段使用服务端默认值。 */
+  chat_api_url?: string
+  chat_api_key?: string
+  chat_model?: string
   /** 聊天生成参数（设置面板提供；缺省由后端的 Settings 默认值决定）。 */
   temperature?: number
   max_tokens?: number
+  top_p?: number
+  frequency_penalty?: number
+  presence_penalty?: number
+  seed?: number
   /** 输出检测跳过策略（设置面板提供；缺省由后端 Settings 默认值决定）。 */
   safe_skip_threshold?: number
   skip_output_when_high_confidence?: boolean
+}
+
+/** 聊天模型的服务端默认值（不含 API Key）。 */
+export interface ChatDefaults {
+  api_url: string
+  model: string
+  api_key_configured: boolean
+  temperature: number
+  max_tokens: number
+  top_p: number
+  frequency_penalty: number
+  presence_penalty: number
+  seed: number | null
 }
 
 export interface HealthInfo {

@@ -26,12 +26,14 @@ RAG 降级、异常分类（``ServiceBusyError`` / ``DetectionError``）语义�
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tuple
 
 from langchain_core.runnables import RunnableConfig
 
 from ..errors import DetectionError, ServiceBusyError
 from ..llm_utils import estimate_tokens
+from ..observability import new_trace, node_span, record_node, trace_from_config, trace_payload
 from .state import CANCELLED_STOP, PipelineState
 
 logger = logging.getLogger(__name__)
@@ -49,16 +51,14 @@ class PipelineSteps(Protocol):
     def _run_chat_guarded(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str: ...
 
     def _run_chat_stream_guarded(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]: ...
 
@@ -81,6 +81,13 @@ def _cancel_event(config: Optional[Dict[str, Any]]):
     """取出编排层注入的取消信号（客户端断流置位）。"""
     configurable = (config or {}).get("configurable") or {}
     return configurable.get("cancel_event")
+
+
+def _chat_options(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """从运行时 config 取聊天配置，避免 API Key 进入会被检查点持久化的状态。"""
+    configurable = (config or {}).get("configurable") or {}
+    options = configurable.get("chat_options")
+    return dict(options) if isinstance(options, dict) else {}
 
 
 def _detection_payload(result: Any) -> Dict[str, Any]:
@@ -196,8 +203,7 @@ def generation_node(
         return {}
 
     prompt = state.get("final_prompt") or state["user_input"]
-    max_tokens = state.get("max_tokens")
-    temperature = state.get("temperature")
+    chat_options = _chat_options(config)
     # 多轮记忆：历史只影响生成，不参与输入检测（信任边界见 README「多轮记忆」）
     history = state.get("history") or None
 
@@ -205,7 +211,7 @@ def generation_node(
         try:
             return {
                 "model_response": steps._run_chat_guarded(
-                    prompt, max_tokens=max_tokens, temperature=temperature, history=history
+                    prompt, chat_options=chat_options, history=history
                 )
             }
         except ServiceBusyError:
@@ -221,7 +227,7 @@ def generation_node(
     tokens_since_check = 0
     checked_tokens = 0
     upstream = steps._run_chat_stream_guarded(
-        prompt, max_tokens=max_tokens, temperature=temperature, history=history
+        prompt, chat_options=chat_options, history=history
     )
     try:
         for delta in upstream:
@@ -371,13 +377,32 @@ def _retry_policy(steps: PipelineSteps):
     )
 
 
-def build_defense_graph(steps: PipelineSteps):
-    """构建并编译 LangGraph 状态图。"""
+def build_defense_graph(
+    steps: PipelineSteps,
+    *,
+    checkpointer: Optional[Any] = None,
+    interrupt_before: Optional[List[str]] = None,
+):
+    """构建并编译 LangGraph 状态图。
+
+    ``checkpointer`` 为 LangGraph 检查点后端；传入后同一 ``thread_id`` 可恢复状态。
+    ``interrupt_before`` 用于人工审批（例如在 ``output_detection`` 前暂停）。
+    """
     from langgraph.graph import END, START, StateGraph
 
     def bind(node: Callable[..., PipelineState]) -> Callable[[PipelineState, RunnableConfig], PipelineState]:
         def runner(state: PipelineState, config: RunnableConfig) -> PipelineState:
-            return node(state, steps, config)
+            started = time.perf_counter()
+            trace = trace_from_config(config)
+            node_name = node.__name__.removesuffix("_node")
+            try:
+                with node_span(node_name):
+                    result = node(state, steps, config)
+            except Exception as exc:
+                record_node(trace, node_name, started, status="error", error=exc)
+                raise
+            record_node(trace, node_name, started)
+            return result
 
         runner.__name__ = node.__name__
         return runner
@@ -398,28 +423,71 @@ def build_defense_graph(steps: PipelineSteps):
         "skip_policy", route_after_policy, {"stop": END, "output_detection": "output_detection"}
     )
     builder.add_edge("output_detection", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
 
 class DefenseAgent:
     """多阶段检测流水线的 Agent 封装（LangGraph 状态图）。"""
 
-    def __init__(self, steps: PipelineSteps) -> None:
+    def __init__(
+        self,
+        steps: PipelineSteps,
+        *,
+        checkpointer: Optional[Any] = None,
+        interrupt_before: Optional[List[str]] = None,
+    ) -> None:
         self._steps = steps
-        self.graph = build_defense_graph(steps)
+        self.graph = build_defense_graph(
+            steps, checkpointer=checkpointer, interrupt_before=interrupt_before
+        )
 
-    def run(self, payload: Dict[str, Any]) -> PipelineState:
-        """同步执行整条流水线，返回最终状态。"""
-        return self.graph.invoke(dict(payload))
+    def run(
+        self,
+        payload: Dict[str, Any],
+        *,
+        thread_id: Optional[str] = None,
+        trace: Optional[Any] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
+    ) -> PipelineState:
+        """同步执行整条流水线，返回最终状态（附带 ``thread_id`` / ``trace``）。"""
+        trace = trace or new_trace(thread_id=thread_id)
+        config = {
+            "configurable": {
+                "thread_id": trace.thread_id,
+                "trace": trace,
+                "chat_options": chat_options or {},
+            }
+        }
+        final = self.graph.invoke(dict(payload), config=config)
+        result = dict(final)
+        result["thread_id"] = trace.thread_id
+        result["trace"] = trace_payload(trace)
+        return result
 
-    def stream(self, payload: Dict[str, Any], cancel_event: Optional[Any] = None) -> Iterator[Tuple[str, Any]]:
+    def stream(
+        self,
+        payload: Dict[str, Any],
+        cancel_event: Optional[Any] = None,
+        *,
+        thread_id: Optional[str] = None,
+        trace: Optional[Any] = None,
+        chat_options: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Tuple[str, Any]]:
         """流式执行流水线，逐事件 yield ``(event, data)``。
 
         自定义流负责 ``input_detection`` / ``rag`` / ``delta`` / ``output_detection``，
         收尾由本方法在状态图结束后补一个 ``done`` 事件。``cancel_event`` 置位后，
         生成节点会在下一个增量处提前结束（用于客户端断流）。
         """
-        config = {"configurable": {"cancel_event": cancel_event}}
+        trace = trace or new_trace(thread_id=thread_id)
+        config = {
+            "configurable": {
+                "cancel_event": cancel_event,
+                "thread_id": trace.thread_id,
+                "trace": trace,
+                "chat_options": chat_options or {},
+            }
+        }
         final: Optional[PipelineState] = None
         for mode, chunk in self.graph.stream(dict(payload), config=config, stream_mode=["custom", "values"]):
             if mode == "custom":
@@ -434,5 +502,7 @@ class DefenseAgent:
                 "is_safe": bool(state.get("is_safe", False)),
                 "stopped_at": state.get("stopped_at"),
                 "model_response": state.get("model_response"),
+                "thread_id": trace.thread_id,
+                "trace": trace_payload(trace),
             },
         )

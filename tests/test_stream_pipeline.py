@@ -63,9 +63,9 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_stream_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
+    def _run_chat_stream_guarded(self, prompt, chat_options=None, history=None):
         self.chat_prompts.append(prompt)
-        self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
+        self.chat_params.append(chat_options)
         self.chat_history.append(history)
         yield from self._chat_chunks
 
@@ -88,7 +88,7 @@ def test_input_unsafe_emits_input_then_done():
 
 
 def test_chat_generation_params_passed_through():
-    """流式路径同样把请求体的 temperature / max_tokens 透传给聊天客户端。"""
+    """流式路径同样把请求体的生成参数透传给聊天客户端。"""
     svc = _StubService(_settings(), input_result=SAFE_INPUT)
     _collect(svc, user_input="你好", temperature=1.2, max_tokens=256)
     assert svc.chat_params == [{"max_tokens": 256, "temperature": 1.2}]
@@ -207,10 +207,10 @@ def test_stream_incremental_output_detection_intercepts_mid_generation():
     assert _names(events) == ["input_detection", "rag", "delta", "output_detection", "done"]
     assert len(svc.output_calls) == 1
     assert svc.output_calls[0]["answer"] == "安" * 600
-    assert events[-1] == (
-        "done",
-        {"is_safe": False, "stopped_at": "output_detection", "model_response": "安" * 600},
-    )
+    assert events[-1][0] == "done"
+    assert events[-1][1]["is_safe"] is False
+    assert events[-1][1]["stopped_at"] == "output_detection"
+    assert events[-1][1]["model_response"] == "安" * 600
 
 
 def test_stream_incremental_output_detection_keeps_generating_when_safe():
@@ -270,10 +270,10 @@ def test_output_unsafe_marks_done_stopped_at_output_detection():
         "done",
     ]
     assert events[-2][1]["is_safe"] is False
-    assert events[-1] == (
-        "done",
-        {"is_safe": False, "stopped_at": "output_detection", "model_response": "REPLY"},
-    )
+    assert events[-1][0] == "done"
+    assert events[-1][1]["is_safe"] is False
+    assert events[-1][1]["stopped_at"] == "output_detection"
+    assert events[-1][1]["model_response"] == "REPLY"
 
 
 def test_rag_no_match_skips_context_and_uses_raw_input():

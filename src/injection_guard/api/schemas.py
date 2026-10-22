@@ -34,15 +34,29 @@ class DefendRequest(BaseModel):
     safe_skip_threshold: Optional[float] = None
     skip_output_when_high_confidence: Optional[bool] = None
 
+    # 请求级聊天模型配置（前端设置面板提供；None 时取 Settings 默认值）。
+    # API Key 只随单次请求传输，服务端不持久化、不写日志。
+    chat_api_url: Optional[str] = None
+    chat_api_key: Optional[str] = None
+    chat_model: Optional[str] = None
+
     # 聊天生成参数（前端设置面板提供；None 时取 Settings 默认值）。
     # 仅当请求未带 model_response（即需要本服务生成回复）时生效。
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    seed: Optional[int] = None
 
     # 会话落库定位（可选）：流式生成结束时由**服务端**把助手消息正文写回会话，
     # 从而「生成完成后刷新页面 / 换设备」也能看到回复；两个字段都缺省时跳过。
     session_id: Optional[str] = None
     assistant_message_id: Optional[str] = None
+
+    # LangGraph 检查点线程 id（可选）：客户端重试 / 恢复时复用同一 thread_id。
+    # 不传则由服务端生成并随响应返回。
+    thread_id: Optional[str] = None
 
     # 输入检测器配置（仅首次初始化生效）
     input_llm_api_url: Optional[str] = None
@@ -53,6 +67,41 @@ class DefendRequest(BaseModel):
     detector_api_key: Optional[str] = None
     detector_api_url: Optional[str] = None
     detector_model_name: Optional[str] = None
+
+    def chat_options(self) -> Dict[str, Any]:
+        """只返回请求实际提供的聊天配置，空白字符串按未提供处理。"""
+        fields = (
+            "chat_api_url",
+            "chat_api_key",
+            "chat_model",
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+        )
+        options: Dict[str, Any] = {}
+        for field in fields:
+            value = getattr(self, field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            options[field.removeprefix("chat_")] = value.strip() if isinstance(value, str) else value
+        return options
+
+
+class ChatDefaultsResponse(BaseModel):
+    """聊天模型的服务端默认值；**不返回 API Key**。"""
+
+    api_url: str
+    model: str
+    api_key_configured: bool
+    temperature: float
+    max_tokens: int
+    top_p: float
+    frequency_penalty: float
+    presence_penalty: float
+    seed: Optional[int] = None
 
 
 class InputDetectionResult(BaseModel):
@@ -109,6 +158,9 @@ class DefendResponse(BaseModel):
     input_detection: Optional[InputDetectionResult] = None
     rag: Optional[RagResult] = None
     output_detection: Optional[OutputDetectionResult] = None
+    # LangGraph 检查点线程与请求级追踪（P1）
+    thread_id: Optional[str] = None
+    trace: Optional[Dict[str, Any]] = None
 
 
 class TestServicesRequest(BaseModel):
@@ -120,8 +172,12 @@ class TestServicesRequest(BaseModel):
 
     # 要测试的服务键：input / output / rag / chat；缺省全部
     services: Optional[List[str]] = None
-    # 每个探测的超时（秒）；缺省 5.0，范围 0.5~60
+    # 每个探测的超时（秒）；缺省 60.0，范围 0.5~60
     timeout: Optional[float] = None
+    # 可选：用前端当前聊天模型配置探测，而不是服务端默认值。
+    chat_api_url: Optional[str] = None
+    chat_api_key: Optional[str] = None
+    chat_model: Optional[str] = None
 
 
 class ServiceProbeResult(BaseModel):

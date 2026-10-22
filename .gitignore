@@ -21,16 +21,15 @@ models/
 *.pt
 *.bin
 *.safetensors
-# RAG 向量索引目录（FAISS save_local 产物，运行时生成/迁移）
-resources/*_index/
+# RAG 源文件指纹元数据（运行时生成）
+resources/*_milvus.json
 
 # 工具缓存
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 
-# 会话持久化数据库（SQLite，运行时生成）
-data/
+# 旧版 SQLite 数据库（项目已改用 PostgreSQL）
 *.sqlite3
 
 # 前端（Node）
@@ -46,3 +45,5 @@ CLAUDE.md
 RESUME.md
 # 简历实现细节（面试材料，本地保留）
 resume/
+
+docs/

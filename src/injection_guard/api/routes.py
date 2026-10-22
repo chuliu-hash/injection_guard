@@ -24,7 +24,13 @@ from .dependencies import (
     get_defense_service,
     validate_defend_request,
 )
-from .schemas import DefendRequest, DefendResponse, TestServicesRequest, TestServicesResponse
+from .schemas import (
+    ChatDefaultsResponse,
+    DefendRequest,
+    DefendResponse,
+    TestServicesRequest,
+    TestServicesResponse,
+)
 from .security import get_current_user_id, require_user
 
 logger = logging.getLogger(__name__)
@@ -59,9 +65,32 @@ def health(service: DefenseService = Depends(get_defense_service)) -> dict:
         "skip_output_when_high_confidence": settings.skip_output_when_high_confidence,
         "safe_skip_threshold": settings.safe_skip_threshold,
         "enable_rag": settings.enable_rag,
+        "checkpoint_backend": "postgres",
         # 进程内 LLM 指标（调用次数 / 平均耗时 / token 用量；重启归零）
         "llm_metrics": llm_metrics.snapshot(),
     }
+
+
+@router.get(
+    "/api/chat_defaults",
+    response_model=ChatDefaultsResponse,
+    summary="聊天模型服务端默认值（不含 API Key）",
+    dependencies=[Depends(require_user)],
+)
+def chat_defaults(service: DefenseService = Depends(get_defense_service)) -> ChatDefaultsResponse:
+    """返回前端初始化表单所用的默认值；运行中修改 env 需重启后才会反映。"""
+    settings = service.settings
+    return ChatDefaultsResponse(
+        api_url=settings.chat_api_url,
+        model=settings.chat_model,
+        api_key_configured=bool(settings.chat_api_key),
+        temperature=settings.chat_temperature,
+        max_tokens=settings.chat_max_tokens,
+        top_p=settings.chat_top_p,
+        frequency_penalty=settings.chat_frequency_penalty,
+        presence_penalty=settings.chat_presence_penalty,
+        seed=settings.chat_seed,
+    )
 
 
 @router.post(
@@ -83,7 +112,7 @@ def test_services(
     ```
 
     服务键 ``input`` / ``output`` / ``rag`` / ``chat``；``timeout`` 为单次探测超时（秒，
-    0.5~60，默认 5）。**总是返回 200**，逐个服务成败在 ``services`` 里；仅当参数非法
+    0.5~60，默认 60）。**总是返回 200**，逐个服务成败在 ``services`` 里；仅当参数非法
     （未知服务名 / 空列表 / timeout 越界）时返回 ``400 {"error": ...}``。
 
     探测不经过流水线并发闸门：即使服务繁忙也要能报出真实状态。
@@ -113,7 +142,21 @@ def test_services(
             content={"error": f"timeout 必须在 {MIN_TIMEOUT}~{MAX_TIMEOUT} 秒之间"},
         )
 
-    return check_services(service.settings, services=services, timeout=timeout)
+    chat_options = {
+        key: value
+        for key, value in {
+            "api_url": data.get("chat_api_url"),
+            "api_key": data.get("chat_api_key"),
+            "model": data.get("chat_model"),
+        }.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
+    return check_services(
+        service.settings,
+        services=services,
+        timeout=timeout,
+        chat_options=chat_options,
+    )
 
 
 @router.post(
@@ -154,8 +197,8 @@ def prompt_defend(
             detector_api_key=payload.detector_api_key,
             detector_api_url=payload.detector_api_url,
             detector_model_name=payload.detector_model_name,
-            temperature=payload.temperature,
-            max_tokens=payload.max_tokens,
+            thread_id=payload.thread_id,
+            chat_options=payload.chat_options(),
             safe_skip_threshold=payload.safe_skip_threshold,
             skip_output_when_high_confidence=payload.skip_output_when_high_confidence,
         )
@@ -171,12 +214,15 @@ def prompt_defend(
         "input_detection": outcome.input_detection,
         "rag": outcome.rag,
         "output_detection": outcome.output_detection,
+        "thread_id": outcome.thread_id,
+        "trace": outcome.trace,
     }
 
 
-def _sse_frame(event: str, data: Any) -> str:
-    """格式化一帧 SSE。"""
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse_frame(event: str, data: Any, event_id: Optional[int] = None) -> str:
+    """格式化一帧 SSE；带 ``id`` 便于客户端定位断点。"""
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{prefix}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @dataclass(frozen=True)
@@ -261,6 +307,7 @@ async def _sse_event_stream(
 
     thread = threading.Thread(target=_worker, name="defense_stream", daemon=True)
     thread.start()
+    event_id = 0
     try:
         while True:
             try:
@@ -271,7 +318,8 @@ async def _sse_event_stream(
             if item is sentinel:
                 break
             event, data = item
-            yield _sse_frame(event, data)
+            event_id += 1
+            yield _sse_frame(event, data, event_id)
     finally:
         # 客户端断开：通知 worker 在下一个事件处停止
         cancelled.set()
@@ -337,8 +385,8 @@ async def chat_stream(
         "detector_api_key": payload.detector_api_key,
         "detector_api_url": payload.detector_api_url,
         "detector_model_name": payload.detector_model_name,
-        "temperature": payload.temperature,
-        "max_tokens": payload.max_tokens,
+        "thread_id": payload.thread_id,
+        "chat_options": payload.chat_options(),
         "safe_skip_threshold": payload.safe_skip_threshold,
         "skip_output_when_high_confidence": payload.skip_output_when_high_confidence,
         # 多轮记忆：服务端从会话里读历史（前端只传 session_id，不信任前端传的历史）

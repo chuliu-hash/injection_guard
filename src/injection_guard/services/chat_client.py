@@ -66,6 +66,10 @@ class ChatClient:
         timeout: Optional[float] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         history_max_tokens: Optional[int] = None,
     ) -> None:
         settings = get_settings()
@@ -77,6 +81,16 @@ class ChatClient:
         self.timeout = timeout if timeout is not None else settings.chat_timeout
         self.max_tokens = max_tokens if max_tokens is not None else settings.chat_max_tokens
         self.temperature = temperature if temperature is not None else settings.chat_temperature
+        self.top_p = top_p if top_p is not None else settings.chat_top_p
+        self.frequency_penalty = (
+            frequency_penalty
+            if frequency_penalty is not None
+            else settings.chat_frequency_penalty
+        )
+        self.presence_penalty = (
+            presence_penalty if presence_penalty is not None else settings.chat_presence_penalty
+        )
+        self.seed = seed if seed is not None else settings.chat_seed
         self.history_max_tokens = (
             history_max_tokens if history_max_tokens is not None else settings.chat_history_max_tokens
         )
@@ -89,12 +103,30 @@ class ChatClient:
             callbacks=[MetricsCallbackHandler("chat")],
         )
 
-    def _bind_model(self, max_tokens: Optional[int], temperature: Optional[float]):
+    def _bind_model(
+        self,
+        max_tokens: Optional[int],
+        temperature: Optional[float],
+        top_p: Optional[float],
+        frequency_penalty: Optional[float],
+        presence_penalty: Optional[float],
+        seed: Optional[int],
+    ):
         """按请求覆盖生成参数（缺省回落实例默认值）。"""
         params = {
             "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+            "top_p": self.top_p if top_p is None else top_p,
+            "frequency_penalty": (
+                self.frequency_penalty if frequency_penalty is None else frequency_penalty
+            ),
+            "presence_penalty": (
+                self.presence_penalty if presence_penalty is None else presence_penalty
+            ),
         }
+        effective_seed = self.seed if seed is None else seed
+        if effective_seed is not None:
+            params["seed"] = effective_seed
         return self.model.bind(**params)
 
     def _build_messages(self, prompt: str, history: Optional[Sequence[Dict[str, str]]]):
@@ -119,6 +151,10 @@ class ChatClient:
         *,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         history: Optional[Sequence[Dict[str, str]]] = None,
     ) -> str:
         """发送单轮用户消息，返回模型回复文本。
@@ -128,7 +164,14 @@ class ChatClient:
         ``history`` 为之前的对话（按时间顺序），用于多轮上下文。
         """
         messages = self._build_messages(prompt, history)
-        response = self._bind_model(max_tokens, temperature).invoke(messages)
+        response = self._bind_model(
+            max_tokens,
+            temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+        ).invoke(messages)
         return message_text(response.content)
 
     def stream(
@@ -137,6 +180,10 @@ class ChatClient:
         *,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         history: Optional[Sequence[Dict[str, str]]] = None,
     ) -> Iterator[str]:
         """流式发送单轮用户消息，逐个 yield 增量文本片段（delta）。
@@ -144,7 +191,14 @@ class ChatClient:
         ``max_tokens`` / ``temperature`` / ``history`` 语义同 :meth:`complete`。
         """
         messages = self._build_messages(prompt, history)
-        for chunk in self._bind_model(max_tokens, temperature).stream(messages):
+        for chunk in self._bind_model(
+            max_tokens,
+            temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+        ).stream(messages):
             text = message_text(chunk.content)
             if text:
                 yield text

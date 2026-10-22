@@ -1,6 +1,6 @@
 """多轮记忆：历史读取、token 裁剪、以及从路由注入到生成阶段的链路。
 
-用临时 SQLite 与桩 ChatModel，不加载模型、不联网。
+用临时 PostgreSQL schema 与桩 ChatModel，不加载模型、不联网。
 """
 
 from __future__ import annotations
@@ -20,15 +20,26 @@ HISTORY = [
 
 
 @pytest.fixture()
-def db(tmp_path, monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'history.db'}")
+def db(postgres_database_url, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     get_settings.cache_clear()
     get_database.cache_clear()
     database = get_database()
     database.create_all()
-    yield database
-    get_settings.cache_clear()
-    get_database.cache_clear()
+    sessions = []
+    create_session = database.session
+
+    def tracked_session():
+        session = create_session()
+        sessions.append(session)
+        return session
+
+    database.session = tracked_session  # type: ignore[method-assign]
+    try:
+        yield database
+    finally:
+        for session in sessions:
+            session.close()
 
 
 def _client(history_max_tokens: int = 2048) -> tuple[ChatClient, RecordingChatModel]:

@@ -50,6 +50,54 @@ def test_resolve_targets_falls_back_to_placeholder_key():
     assert targets["chat"].api_key == connectivity._PLACEHOLDER_KEY
 
 
+def test_resolve_targets_uses_request_chat_config():
+    targets = connectivity.resolve_targets(
+        _fake_settings(),
+        chat_options={
+            "api_url": "https://example.com/v1",
+            "model": "model-x",
+            "api_key": "secret",
+        },
+    )
+
+    assert targets["chat"].base_url == "https://example.com/v1"
+    assert targets["chat"].model == "model-x"
+    assert targets["chat"].api_key == "secret"
+
+
+def test_custom_chat_url_does_not_inherit_server_key():
+    settings = _fake_settings()
+    settings.chat_api_key = "server-secret"
+    targets = connectivity.resolve_targets(
+        settings, chat_options={"api_url": "https://example.com/v1"}
+    )
+
+    assert targets["chat"].api_key == connectivity._PLACEHOLDER_KEY
+
+
+def test_same_chat_url_inherits_server_key():
+    """前端回传服务端默认 URL 时，不应误判为自定义地址而丢弃 .env 中的 Key。"""
+    settings = _fake_settings()
+    settings.chat_api_key = "server-secret"
+    targets = connectivity.resolve_targets(
+        settings,
+        chat_options={"api_url": settings.chat_api_url, "api_key": ""},
+    )
+
+    assert targets["chat"].api_key == "server-secret"
+
+
+def test_same_chat_url_with_trailing_slash_inherits_server_key():
+    settings = _fake_settings()
+    settings.chat_api_key = "server-secret"
+    targets = connectivity.resolve_targets(
+        settings,
+        chat_options={"api_url": settings.chat_api_url + "/"},
+    )
+
+    assert targets["chat"].api_key == "server-secret"
+
+
 @pytest.mark.parametrize(
     ("given", "expected"),
     [(None, connectivity.DEFAULT_TIMEOUT), (0.1, connectivity.MIN_TIMEOUT), (999, connectivity.MAX_TIMEOUT), (3.5, 3.5)],

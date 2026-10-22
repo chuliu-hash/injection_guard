@@ -63,9 +63,9 @@ class _StubService(DefenseService):
             raise self._rag_exc
         return self._rag_result
 
-    def _run_chat_guarded(self, prompt, max_tokens=None, temperature=None, history=None):
+    def _run_chat_guarded(self, prompt, chat_options=None, history=None):
         self.chat_prompts.append(prompt)
-        self.chat_params.append({"max_tokens": max_tokens, "temperature": temperature})
+        self.chat_params.append(chat_options)
         self.chat_history.append(history)
         return self._chat_reply
 
@@ -100,17 +100,32 @@ def test_history_is_forwarded_to_chat():
 
 
 def test_chat_generation_params_passed_through():
-    """请求体的 temperature / max_tokens 透传给聊天客户端。"""
+    """请求体的生成参数透传给聊天客户端。"""
     svc = _StubService(_settings(), input_result=SAFE_INPUT)
     svc.detect(user_input="你好", temperature=0.3, max_tokens=64)
     assert svc.chat_params == [{"max_tokens": 64, "temperature": 0.3}]
 
 
+def test_chat_model_options_passed_through():
+    """请求级 URL / Key / 模型名与采样参数原样进入流水线。"""
+    svc = _StubService(_settings(), input_result=SAFE_INPUT)
+    options = {
+        "api_url": "https://example.com/v1",
+        "api_key": "secret",
+        "model": "chat-model",
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "seed": 42,
+    }
+    svc.detect(user_input="你好", chat_options=options)
+    assert svc.chat_params == [options]
+
+
 def test_chat_generation_params_default_none():
-    """未提供时传 None，由 ChatClient 回落到 Settings 默认值。"""
+    """未提供时传空配置，由 ChatClient 回落到 Settings 默认值。"""
     svc = _StubService(_settings(), input_result=SAFE_INPUT)
     svc.detect(user_input="你好")
-    assert svc.chat_params == [{"max_tokens": None, "temperature": None}]
+    assert svc.chat_params == [{}]
 
 
 def test_request_skip_flag_enables_output_skip():

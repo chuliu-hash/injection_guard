@@ -17,25 +17,25 @@ dependencies = [
     "openai>=1.0",
     "numpy",
     "requests",
-    # 会话/消息持久化（SQLite 默认，生产可切 PostgreSQL；PG 驱动需另装 psycopg[binary]）
+    # 会话/消息持久化与 P1 检查点：PostgreSQL 是唯一数据库后端。
     "sqlalchemy>=2.0",
+    "psycopg[binary]>=3",
+    "psycopg-pool>=3.2",
     # 登录鉴权：PyJWT 签发/校验访问令牌；bcrypt 哈希口令
     "pyjwt>=2.8",
     "bcrypt>=4.0",
     # Agent 编排 + RAG（LangChain 生态）：
     #   * langgraph —— 检测流水线的状态图编排（节点 / 条件边 / 事件流）；
-    #   * langchain-core —— Embeddings / VectorStore / Retriever 接口层；
-    #   * langchain-community —— FAISS 向量库集成（独立的 langchain-faiss 需
-    #     Python>=3.11，本项目为 3.10，故仍走 community 0.4.x）；
-    #   * faiss-cpu —— 本地向量索引后端（与 torch 2.5.1 无冲突）。
+    #   * langchain-core —— Embeddings 接口层；
+    #   * pymilvus —— Milvus 向量数据库客户端。
     "langgraph>=1.0,<2",
+    "langgraph-checkpoint-postgres>=2",
     "langchain>=1.0,<2",
-    "langchain-community>=0.4,<1",
     #   * langchain-openai —— ChatModel 接入本地/云端 OpenAI 兼容接口（聊天生成 +
     #     输入/输出检测的 LLM 调用）；注意它按官方 API 发 max_completion_tokens，
     #     本地推理服务（llm_server.ChatCompletionRequest）已同时兼容该字段名。
     "langchain-openai>=1.0,<2",
-    "faiss-cpu>=1.9",
+    "pymilvus>=2.4,<3",
     # 模型推理相关：以下为**已验证可共存**的组合，勿随意升级（详见 requirements.txt 注释）。
     # transformers 5.x 需 torch>=2.6，但 GPTQ 加载所需的 gptqmodel 在 torch 2.6
     # 只有 manylinux_2_28 内核 wheel（本机 glibc 2.27 不可用），故整体停在 4.x + torch 2.5。
@@ -56,13 +56,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.4"]
+dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.4", "milvus-lite>=2.4"]
+# P1：OpenTelemetry 导出（未安装时代码自动 no-op）
+observability = [
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp>=1.25",
+]
 
 [project.scripts]
 injection-guard-defense = "injection_guard.cli.serve_defense:main"
 injection-guard-llm = "injection_guard.cli.serve_llm:main"
 injection-guard-embed = "injection_guard.cli.serve_embed:main"
 injection-guard-deploy = "injection_guard.cli.deploy:main"
+injection-guard-eval = "injection_guard.cli.eval_guardrails:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -63,6 +63,11 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
+    # OpenAI 兼容的采样参数。本地实现把正向 penalty 近似映射为 repetition_penalty；
+    # seed 用于固定采样随机源，便于复现。远程服务按各厂商语义执行。
+    frequency_penalty: Optional[float] = 0.0
+    presence_penalty: Optional[float] = 0.0
+    seed: Optional[int] = None
     n: Optional[int] = 1
     stream: Optional[bool] = False
     logprobs: Optional[bool] = False
@@ -556,6 +561,9 @@ def _prepare_generation(
     temperature = request.temperature if request.temperature is not None else 0.7
     top_p = request.top_p if request.top_p is not None else 0.9
     do_sample = temperature > 0.0
+    penalty = max(0.0, request.frequency_penalty or 0.0, request.presence_penalty or 0.0)
+    if request.seed is not None:
+        torch.manual_seed(request.seed)
     from transformers import GenerationConfig
 
     if output_scores is None:
@@ -568,7 +576,7 @@ def _prepare_generation(
         output_scores=output_scores,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        repetition_penalty=1.1,
+        repetition_penalty=min(2.0, 1.1 + penalty),
     )
     if do_sample:
         generation_config.temperature = temperature

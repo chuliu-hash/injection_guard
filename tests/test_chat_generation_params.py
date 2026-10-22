@@ -23,8 +23,23 @@ def _client(reply: str = "hi") -> tuple[ChatClient, RecordingChatModel]:
 
 def test_request_params_override_defaults() -> None:
     client, model = _client()
-    assert client.complete("你好", max_tokens=7, temperature=0.1) == "hi"
-    assert model.calls[0]["kwargs"] == {"temperature": 0.1, "max_tokens": 7}
+    assert client.complete(
+        "你好",
+        max_tokens=7,
+        temperature=0.1,
+        top_p=0.8,
+        frequency_penalty=0.2,
+        presence_penalty=0.3,
+        seed=42,
+    ) == "hi"
+    assert model.calls[0]["kwargs"] == {
+        "temperature": 0.1,
+        "max_tokens": 7,
+        "top_p": 0.8,
+        "frequency_penalty": 0.2,
+        "presence_penalty": 0.3,
+        "seed": 42,
+    }
 
 
 def test_omitted_params_fall_back_to_settings() -> None:
@@ -34,13 +49,22 @@ def test_omitted_params_fall_back_to_settings() -> None:
     assert model.calls[0]["kwargs"] == {
         "temperature": settings.chat_temperature,
         "max_tokens": settings.chat_max_tokens,
+        "top_p": settings.chat_top_p,
+        "frequency_penalty": settings.chat_frequency_penalty,
+        "presence_penalty": settings.chat_presence_penalty,
     }
 
 
 def test_stream_forwards_request_params() -> None:
     client, model = _client("hello")
     assert list(client.stream("你好", max_tokens=11, temperature=0.9)) == ["hello"]
-    assert model.calls[0]["kwargs"] == {"temperature": 0.9, "max_tokens": 11}
+    assert model.calls[0]["kwargs"] == {
+        "temperature": 0.9,
+        "max_tokens": 11,
+        "top_p": get_settings().chat_top_p,
+        "frequency_penalty": get_settings().chat_frequency_penalty,
+        "presence_penalty": get_settings().chat_presence_penalty,
+    }
 
 
 def test_prompt_is_rendered_as_single_user_message() -> None:
@@ -69,3 +93,4 @@ def test_settings_keeps_chat_defaults() -> None:
     settings = get_settings()
     assert settings.chat_max_tokens == 1024
     assert settings.chat_temperature == 0.7
+    assert settings.chat_top_p == 0.9

@@ -14,6 +14,10 @@
 | `serve_chat.sh` | 普通聊天 LLM | 8097 | `--service chat`（读 `CHAT_API_SERVER_*`） |
 | `serve_embed.sh` | Embedding | 8096 | RAG 增强所需 |
 | `_common.sh` | — | — | 公共部分（**勿直接执行**）：定位仓库根、激活 conda、载入 `deploy.env` |
+| `run_p1.sh` | P1 验证 | — | 非交互式执行 ruff / pytest / 评测自检；失败汇总后退出 |
+
+RAG 使用 Milvus 存储向量与文本，默认地址 `http://localhost:19530`。启动防御 API 前需先运行
+Milvus Standalone；`serve_embed.sh` 只负责 Embedding 模型服务（8096），不包含 Milvus。
 
 ## 用法
 
@@ -35,6 +39,11 @@ HOST=0.0.0.0 scripts/serve_defense.sh          # 对外监听
 # 额外参数透传（后写覆盖前写）
 scripts/serve_input.sh --public                # 起 cloudflared 隧道
 scripts/serve_defense.sh --help
+
+# P1 自动验证（无交互；默认使用 injection_guard conda 环境）
+scripts/run_p1.sh
+PYTHON_BIN=/path/to/python scripts/run_p1.sh
+RUN_FRONTEND=1 scripts/run_p1.sh
 ```
 
 脚本会：

@@ -15,8 +15,10 @@ from injection_guard.api.security import get_current_user
 class _StubService:
     def __init__(self, events):
         self._events = events
+        self.kwargs = None
 
     def stream_detect(self, **_kw):
+        self.kwargs = _kw
         yield from self._events
 
 
@@ -70,6 +72,53 @@ def test_stream_returns_event_sequence():
     assert parsed[-1][1]["model_response"] == "你好"
 
 
+def test_stream_events_have_monotonic_ids():
+    events = [
+        ("input_detection", {"is_safe": True}),
+        ("done", {"is_safe": True, "stopped_at": None, "model_response": "你好"}),
+    ]
+    client = _client(_StubService(events))
+    resp = client.post("/api/chat_stream", json={"user_input": "你好", "thread_id": "thread-1"})
+
+    assert resp.status_code == 200
+    ids = [
+        int(line.split(":", 1)[1].strip())
+        for line in resp.text.splitlines()
+        if line.startswith("id:")
+    ]
+    assert ids == [1, 2]
+
+
+def test_stream_forwards_request_chat_options():
+    events = [("done", {"is_safe": True, "stopped_at": None, "model_response": "ok"})]
+    service = _StubService(events)
+    client = _client(service)
+    resp = client.post(
+        "/api/chat_stream",
+        json={
+            "user_input": "你好",
+            "chat_api_url": "https://example.com/v1",
+            "chat_api_key": "secret",
+            "chat_model": "model-x",
+            "temperature": 0.2,
+            "max_tokens": 128,
+            "top_p": 0.7,
+            "seed": 7,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert service.kwargs["chat_options"] == {
+        "api_url": "https://example.com/v1",
+        "api_key": "secret",
+        "model": "model-x",
+        "temperature": 0.2,
+        "max_tokens": 128,
+        "top_p": 0.7,
+        "seed": 7,
+    }
+
+
 def test_stream_missing_user_input_returns_400_json():
     client = _client(_StubService([]))
     resp = client.post("/api/chat_stream", json={"model_response": "x"})
@@ -95,103 +144,85 @@ def _persist_client(service, user_id: str) -> TestClient:
     return TestClient(app)
 
 
-def test_stream_persists_assistant_content_from_done_event(tmp_path, monkeypatch):
+def test_stream_persists_assistant_content_from_done_event(postgres_database_url, monkeypatch):
     """done 事件里的 model_response 由服务端写回会话，刷新页面也能看到回复。"""
-    from injection_guard.config import get_settings
     from injection_guard.persistence.database import get_database
     from injection_guard.persistence.repository import SessionRepository
 
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'stream.db'}")
-    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     get_database.cache_clear()
-    try:
-        events = [
-            ("delta", {"content": "你好"}),
-            ("done", {"is_safe": True, "stopped_at": None, "model_response": "你好！很高兴见到你"}),
-        ]
-        with _persist_client(_StubService(events), "u1") as client:
-            db = get_database()  # create_app 已建表
-            with db.session() as session:
-                repo = SessionRepository(session, user_id="u1")
-                chat = repo.create_session(title="t")
-                message = repo.append_message(chat.id, "assistant")
-
-            resp = client.post(
-                "/api/chat_stream",
-                json={
-                    "user_input": "你好",
-                    "session_id": chat.id,
-                    "assistant_message_id": message.id,
-                },
-            )
-
-        assert resp.status_code == 200
+    events = [
+        ("delta", {"content": "你好"}),
+        ("done", {"is_safe": True, "stopped_at": None, "model_response": "你好！很高兴见到你"}),
+    ]
+    with _persist_client(_StubService(events), "u1") as client:
+        db = get_database()  # create_app 已建表
         with db.session() as session:
-            stored = SessionRepository(session, user_id="u1").get_session(chat.id)
-            assert stored.messages[0].content == "你好！很高兴见到你"
-            assert stored.messages[0].status == "done"
-    finally:
-        get_settings.cache_clear()
-        get_database.cache_clear()
+            repo = SessionRepository(session, user_id="u1")
+            chat = repo.create_session(title="t")
+            message = repo.append_message(chat.id, "assistant")
+
+        resp = client.post(
+            "/api/chat_stream",
+            json={
+                "user_input": "你好",
+                "session_id": chat.id,
+                "assistant_message_id": message.id,
+            },
+        )
+
+    assert resp.status_code == 200
+    with db.session() as session:
+        stored = SessionRepository(session, user_id="u1").get_session(chat.id)
+        assert stored.messages[0].content == "你好！很高兴见到你"
+        assert stored.messages[0].status == "done"
 
 
-def test_stream_persists_output_blocked_text(tmp_path, monkeypatch):
+def test_stream_persists_output_blocked_text(postgres_database_url, monkeypatch):
     """输出检测拦截：落库拦截文案，而不是模型原文。"""
     from injection_guard.agent.state import OUTPUT_BLOCKED_TEXT
-    from injection_guard.config import get_settings
     from injection_guard.persistence.database import get_database
     from injection_guard.persistence.repository import SessionRepository
 
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'stream2.db'}")
-    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     get_database.cache_clear()
-    try:
-        events = [
-            ("output_detection", {"is_safe": False, "failed_rules": ["R1"], "total_rules": 5}),
-            ("done", {"is_safe": False, "stopped_at": "output_detection", "model_response": "危险原文"}),
-        ]
-        with _persist_client(_StubService(events), "u2") as client:
-            db = get_database()
-            with db.session() as session:
-                repo = SessionRepository(session, user_id="u2")
-                chat = repo.create_session(title="t")
-                message = repo.append_message(chat.id, "assistant")
-
-            resp = client.post(
-                "/api/chat_stream",
-                json={
-                    "user_input": "你好",
-                    "session_id": chat.id,
-                    "assistant_message_id": message.id,
-                },
-            )
-
-        assert resp.status_code == 200
+    events = [
+        ("output_detection", {"is_safe": False, "failed_rules": ["R1"], "total_rules": 5}),
+        ("done", {"is_safe": False, "stopped_at": "output_detection", "model_response": "危险原文"}),
+    ]
+    with _persist_client(_StubService(events), "u2") as client:
+        db = get_database()
         with db.session() as session:
-            stored = SessionRepository(session, user_id="u2").get_session(chat.id)
-            assert stored.messages[0].content == OUTPUT_BLOCKED_TEXT
-    finally:
-        get_settings.cache_clear()
-        get_database.cache_clear()
+            repo = SessionRepository(session, user_id="u2")
+            chat = repo.create_session(title="t")
+            message = repo.append_message(chat.id, "assistant")
+
+        resp = client.post(
+            "/api/chat_stream",
+            json={
+                "user_input": "你好",
+                "session_id": chat.id,
+                "assistant_message_id": message.id,
+            },
+        )
+
+    assert resp.status_code == 200
+    with db.session() as session:
+        stored = SessionRepository(session, user_id="u2").get_session(chat.id)
+        assert stored.messages[0].content == OUTPUT_BLOCKED_TEXT
 
 
-def test_stream_without_session_ids_skips_persistence(tmp_path, monkeypatch):
+def test_stream_without_session_ids_skips_persistence(postgres_database_url, monkeypatch):
     """未带会话定位（脚本 / 旧前端）时不做落库，接口行为不变。"""
-    from injection_guard.config import get_settings
     from injection_guard.persistence.database import get_database
 
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'stream3.db'}")
-    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_URL", postgres_database_url)
     get_database.cache_clear()
-    try:
-        events = [("done", {"is_safe": True, "stopped_at": None, "model_response": "hi"})]
-        with _persist_client(_StubService(events), "u3") as client:
-            resp = client.post("/api/chat_stream", json={"user_input": "你好"})
-        assert resp.status_code == 200
-        assert _parse_sse(resp.text)[-1][0] == "done"
-    finally:
-        get_settings.cache_clear()
-        get_database.cache_clear()
+    events = [("done", {"is_safe": True, "stopped_at": None, "model_response": "hi"})]
+    with _persist_client(_StubService(events), "u3") as client:
+        resp = client.post("/api/chat_stream", json={"user_input": "你好"})
+    assert resp.status_code == 200
+    assert _parse_sse(resp.text)[-1][0] == "done"
 
 
 def test_final_assistant_content_mapping():
