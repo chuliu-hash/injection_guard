@@ -30,7 +30,6 @@ class DefendRequest(BaseModel):
     sensitivity: Optional[str] = None
 
     # 输出检测跳过策略（前端设置面板提供；None 时取 Settings 默认值）。
-    # ⚠️ 客户端可控 = 可自行关闭输出侧检测，属安全面削弱。
     safe_skip_threshold: Optional[float] = None
     skip_output_when_high_confidence: Optional[bool] = None
 
@@ -50,7 +49,6 @@ class DefendRequest(BaseModel):
     seed: Optional[int] = None
 
     # 会话落库定位（可选）：流式生成结束时由**服务端**把助手消息正文写回会话，
-    # 从而「生成完成后刷新页面 / 换设备」也能看到回复；两个字段都缺省时跳过。
     session_id: Optional[str] = None
     assistant_message_id: Optional[str] = None
 
