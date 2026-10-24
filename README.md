@@ -36,8 +36,8 @@
 
 环境要求：Python 3.10+（建议 conda）；PostgreSQL 13+；Milvus 2.4+（默认
 `http://localhost:19530`）；只在开发前端时需要 Node.js 20+；本地跑模型需要 NVIDIA GPU。
-默认连接 `postgresql://chuliu:123456@127.0.0.1:5432`，未写库名时使用与用户名同名的
-`chuliu` 数据库。
+默认连接独立业务库 `postgresql://chuliu:123456@127.0.0.1:5432/injection_guard`。
+应用启动时会先检查该数据库，不存在则自动创建，再建立业务连接并建表。
 
 ```bash
 # 1) 安装依赖
@@ -142,7 +142,7 @@ huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2 --local-d
 | `RAG_MAX_DISTANCE` | 0 | 检索命中的最大距离（Milvus L2 距离，越小越相似；0 = 不过滤） |
 | `DETECT_NODE_MAX_ATTEMPTS` | 2 | 检测节点最多尝试次数（1 = 不重试） |
 | `OUTPUT_DETECT_INTERVAL_TOKENS` | 512 | 流式回复的增量检测间隔（0 = 关闭） |
-| `DATABASE_URL` | `postgresql://chuliu:123456@127.0.0.1:5432` | PostgreSQL DSN；其他数据库 URL 会被拒绝 |
+| `DATABASE_URL` | `postgresql://chuliu:123456@127.0.0.1:5432/injection_guard` | 必须包含显式数据库名；应用会自动建库，其他数据库 URL 会被拒绝 |
 
 ## 测试
 

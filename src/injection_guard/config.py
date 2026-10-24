@@ -37,9 +37,9 @@ SENSITIVITY_LEVELS = ("low", "medium", "high")
 # 运行时服务参数文件（绝对路径）：访问/连接项在 .env，各服务的调参/并发/生成参数在此。
 _SERVICES_ENV_FILE = _REPO_ROOT / "configs" / "services.env"
 
-# PostgreSQL 是唯一支持的持久化后端；未显式配置时连接本机实例。
-# DSN 未写数据库名时，psycopg/libpq 默认使用与用户名同名的数据库。
-DEFAULT_DATABASE_URL = "postgresql://chuliu:123456@127.0.0.1:5432"
+# PostgreSQL 是唯一支持的持久化后端；使用独立业务库，避免与用户名同名库混用。
+# 应用启动时会先检查并创建该数据库，再建立业务连接。
+DEFAULT_DATABASE_URL = "postgresql://chuliu:123456@127.0.0.1:5432/injection_guard"
 _POSTGRES_DRIVERS = {"postgresql", "postgresql+psycopg"}
 
 
@@ -199,12 +199,18 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def _require_postgresql(cls, value: str) -> str:
-        """只接受 PostgreSQL，避免部署时静默退回本地文件数据库。"""
-        driver = urlsplit(value).scheme.lower()
+        """只接受带显式数据库名的 PostgreSQL DSN。"""
+        parsed = urlsplit(value)
+        driver = parsed.scheme.lower()
         if driver not in _POSTGRES_DRIVERS:
             raise ValueError(
                 "DATABASE_URL 仅支持 PostgreSQL "
                 f"（postgresql:// 或 postgresql+psycopg://），当前为 {driver or '空'}"
+            )
+        if not parsed.path.lstrip("/").strip():
+            raise ValueError(
+                "DATABASE_URL 必须显式包含数据库名，例如 "
+                "postgresql://user:password@127.0.0.1:5432/injection_guard"
             )
         return value
 

@@ -76,8 +76,16 @@ def test_dotenv_side_fields_still_work(tmp_path: Path) -> None:
 def test_default_database_is_postgres(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     settings = Settings(_env_file=None)
-    assert DEFAULT_DATABASE_URL == "postgresql://chuliu:123456@127.0.0.1:5432"
+    assert DEFAULT_DATABASE_URL == (
+        "postgresql://chuliu:123456@127.0.0.1:5432/injection_guard"
+    )
     assert settings.database_url == DEFAULT_DATABASE_URL
+
+
+def test_database_url_requires_explicit_database_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@localhost:5432")
+    with pytest.raises(ValueError, match="必须显式包含数据库名"):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize(

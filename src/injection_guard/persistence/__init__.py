@@ -5,7 +5,7 @@
 由 ``api/session_routes.py`` 暴露 REST 接口给前端。
 """
 
-from .database import Database, get_database, get_db_session
+from .database import Database, ensure_database_exists, get_database, get_db_session
 from .models import Base, ChatMessageRow, ChatSessionRow, DetectionRow, UserRow
 from .repository import DEFAULT_TITLE, SessionRepository
 from .user_repository import UserRepository
@@ -20,6 +20,7 @@ __all__ = [
     "SessionRepository",
     "UserRepository",
     "UserRow",
+    "ensure_database_exists",
     "get_database",
     "get_db_session",
 ]

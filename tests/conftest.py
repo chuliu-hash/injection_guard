@@ -17,7 +17,10 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from injection_guard.config import DEFAULT_DATABASE_URL, get_settings  # noqa: E402
-from injection_guard.persistence.database import get_database  # noqa: E402
+from injection_guard.persistence.database import (  # noqa: E402
+    ensure_database_exists,
+    get_database,
+)
 
 
 def _database_url(schema: str) -> str:
@@ -51,6 +54,7 @@ def _dispose_database() -> None:
 # 模块级 ``app = create_app()`` 会在测试收集时导入并建表；先提供一个临时 schema，
 # 避免测试触达业务 schema。每个用例再由 autouse fixture 切换到独立的 schema。
 _BOOTSTRAP_SCHEMA = f"ig_bootstrap_{uuid.uuid4().hex[:12]}"
+ensure_database_exists(DEFAULT_DATABASE_URL)
 _create_schema(_BOOTSTRAP_SCHEMA)
 os.environ["DATABASE_URL"] = _database_url(_BOOTSTRAP_SCHEMA)
 atexit.register(_drop_schema, _BOOTSTRAP_SCHEMA)
